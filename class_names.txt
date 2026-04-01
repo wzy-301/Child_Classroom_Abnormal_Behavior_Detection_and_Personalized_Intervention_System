@@ -1,0 +1,5 @@
+normal
+lie
+stand
+play_phone
+fight
