@@ -8,7 +8,16 @@ class ConfigManager:
             "detection": {
                 "conf_thres": 0.35,
                 "sim_thres": 0.25,
-                "cooldown": 3.0
+                "cooldown": 3.0,
+                "class_thresholds": {
+                    "lie": 0.20,
+                    "stand": 0.30,
+                    "play_phone": 0.25,
+                    "fight": 0.20,
+                    "whispering": 0.28,
+                    "looking_around": 0.30,
+                    "normal": 0.15
+                }
             },
             "ui": {
                 "window_width": 1300,

@@ -53,6 +53,8 @@ lie
 stand
 play_phone
 fight
+whispering
+looking_around
 在 `./images` 目录下创建对应的文件夹，并放入示例图片：
 ./images/
 ├── normal/
@@ -66,6 +68,10 @@ fight
 ├── play_phone/
 │ └── ...
 └── fight/
+└── ...
+├── whispering/
+│ └── ...
+└── looking_around/
 └── ...
 
 ### 2. 生成原型

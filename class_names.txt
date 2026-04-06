@@ -3,3 +3,5 @@ lie
 stand
 play_phone
 fight
+whispering
+looking_around

@@ -37,10 +37,23 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # 干预建议映射
 INTERVENTION_MAP = {
     "lie": "【干预建议】学生趴桌，提醒端正坐姿，保持专注",
-    "stand": "【干预建议】学生离座，引导回到座位，遵守课堂秩序",
+    "stand": "【注意】检测到学生站立，请确认：\n1. 是否经允许回答问题\n2. 是否擅自离座\n3. 是否小组活动需要",
     "play_phone": "【干预建议】发现使用手机，提醒收起电子设备",
     "fight": "【干预建议】发现打闹行为，立即制止，维持课堂安全",
+    "whispering": "【干预建议】检测到交头接耳，请提醒保持安静，专注听讲",
+    "looking_around": "【干预建议】检测到东张西望，请引导关注课堂内容",
     "normal": "状态正常，无需干预"
+}
+
+# 类别特定阈值
+CLASS_THRESHOLDS = {
+    "lie": 0.20,          # 趴桌特征明显，可降低阈值
+    "stand": 0.30,        # 站立容易误判，提高阈值
+    "play_phone": 0.25,   # 保持默认
+    "fight": 0.20,        # 打闹特征明显
+    "whispering": 0.28,   # 交头接耳
+    "looking_around": 0.30, # 东张西望
+    "normal": 0.15,       # 正常行为阈值较低
 }
 
 class StatisticsManager:
@@ -166,7 +179,7 @@ clip_model, preprocess = clip.load("ViT-B/32", device=DEVICE)
 clip_model.eval()
 yolo = YOLO(YOLO_WEIGHT)
 
-def classify_crop(frame, box):
+def classify_crop(frame, box, use_class_specific=True):
     """对裁剪区域进行分类"""
     try:
         x1, y1, x2, y2 = map(int, box)
@@ -194,9 +207,23 @@ def classify_crop(frame, box):
         pred = "unknown"
         for cls, proto in prototypes.items():
             sim = torch.cosine_similarity(feat, proto.to(DEVICE)).item()
-            if sim > max_sim:
+            
+            if use_class_specific:
+                # 使用类别特定阈值
+                threshold = CLASS_THRESHOLDS.get(cls, SIM_THRES)
+                condition = sim > threshold
+            else:
+                # 使用全局阈值
+                condition = sim > SIM_THRES
+            
+            # 满足阈值条件且相似度更高
+            if condition and sim > max_sim:
                 max_sim = sim
                 pred = cls
+        
+        # 如果没有满足阈值的类别
+        if pred == "unknown":
+            return "unknown", 0
                 
         return pred, max_sim
         
@@ -204,21 +231,25 @@ def classify_crop(frame, box):
         logger.error(f"分类异常: {str(e)}")
         return "error", 0
 
-def detect_and_draw(frame, conf_thres=CONF_THRES, sim_thres=SIM_THRES):
+def detect_and_draw(frame, conf_thres=CONF_THRES, sim_thres=SIM_THRES, use_class_specific=True):
     """检测并绘制结果"""
     current_abnormal = set()
     try:
         results = yolo(frame, classes=[0], conf=conf_thres)
         for r in results:
             for box in r.boxes.xyxy:
-                cls_name, sim = classify_crop(frame, box)
+                cls_name, sim = classify_crop(frame, box, use_class_specific)
                 if cls_name not in CLASS_NAMES:
                     continue
-                if sim > sim_thres and cls_name != "normal":
+
+                # 判断是否为异常行为
+                is_abnormal = cls_name != "normal"
+                if is_abnormal:
                     current_abnormal.add(cls_name)
+                
+                # 绘制边界框和标签
                 x1, y1, x2, y2 = map(int, box)
-                is_ab = cls_name != "normal"
-                color = (0, 0, 255) if is_ab else (0, 255, 0)
+                color = (0, 0, 255) if is_abnormal else (0, 255, 0)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 cv2.putText(frame, f"{cls_name} {sim:.2f}",
                             (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
@@ -863,6 +894,8 @@ class MainWindow(QMainWindow):
             <li>stand - 离座</li>
             <li>play_phone - 使用手机</li>
             <li>fight - 打闹</li>
+            <li>whispering - 交头接耳</li>
+            <li>looking_around - 东张西望</li>
         </ul>
         <p><b>核心功能:</b></p>
         <ul>
