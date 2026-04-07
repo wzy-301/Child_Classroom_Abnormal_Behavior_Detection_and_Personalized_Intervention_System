@@ -1,6 +1,6 @@
 torch>=2.0.0
 torchvision>=0.15.0
-git+https://github.com/openai/CLIP.git
+clip-by-openai
 opencv-python>=4.8.0
 ultralytics>=8.0.0
 numpy>=1.24.0
