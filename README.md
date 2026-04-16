@@ -58,6 +58,7 @@
 └── session_history.json  # 会话历史(生成)
 
 └── images/               # 训练图片目录
+
     ├── normal/           # 正常行为图片
     ├── lie/              # 趴桌行为图片
     ├── stand/            # 站立行为图片
