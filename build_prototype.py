@@ -4,116 +4,166 @@ import torch
 import pickle
 from PIL import Image
 import logging
+import numpy as np
+from sklearn.cluster import KMeans
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-def check_image_folder():
-    """检查图片文件夹结构"""
-    root = "./images"
-    if not os.path.exists(root):
-        logger.error(f"图片目录不存在: {root}")
-        print("❌ 错误: 请创建 ./images 目录，并在其中为每个行为类别创建子文件夹")
-        return False
-    
-    # 读取类别名称
-    if not os.path.exists("class_names.txt"):
-        logger.error("class_names.txt 文件不存在")
-        print("❌ 错误: 请创建 class_names.txt 文件，每行一个行为类别")
-        return False
+# 策略1: 多视角描述 - 每个类别用多个不同角度描述
+CLASS_DESCRIPTIONS_MULTI = {
+    "normal": [
+        "student sitting properly, hands on desk or holding pen, looking at teacher or blackboard, no electronic device",
+        "attentive student, upright posture, studying, listening to lesson, hands empty or with book",
+        "good student behavior, focused on class, no phone visible, paying attention to teacher"
+    ],
+    "lie": [
+        "student head down on desk, lying on table, sleeping in class",
+        "student collapsed on desk, head resting on arms, not paying attention",
+        "student bending over desk, head down, lazy posture"
+    ],
+    "stand": [
+        "student standing up from chair, out of seat, rising from desk",
+        "student on feet, standing in classroom, not seated",
+        "student upright standing, away from desk, out of chair"
+    ],
+    "play_phone": [
+        "student looking down at smartphone, holding mobile phone with both hands, phone screen visible",
+        "student using cellphone in class, head down staring at phone, distracted by device",
+        "student hiding phone, looking at electronic device, not paying attention to teacher"
+    ],
+    "fight": [
+        "two students fighting, hitting each other, physical conflict",
+        "students pushing and shoving, aggressive physical contact",
+        "students in physical altercation, fighting in classroom"
+    ],
+    "whispering": [
+        "two students talking secretly, heads close together, whispering",
+        "students chatting quietly, leaning toward each other, private conversation",
+        "students speaking softly, close interaction, not listening to teacher"
+    ],
+    "looking_around": [
+        "student looking left and right, turning head around, distracted",
+        "student gazing around classroom, not looking at teacher, wandering eyes",
+        "student head turning, looking at classmates, distracted attention"
+    ]
+}
+
+# 策略2: 负样本描述 - 明确说明不是什么
+NEGATIVE_DESCRIPTIONS = {
+    "normal": "student not sleeping, not using phone, NO mobile device, NO electronic gadget, not talking",
+    "lie": "student not sitting upright, not paying attention, head down",
+    "stand": "student not seated, not in chair, standing on feet",
+    "play_phone": "student not listening, not looking at teacher, using phone",
+    "fight": "students not peaceful, physical conflict, aggressive",
+    "whispering": "students not silent, talking to each other, not listening",
+    "looking_around": "student not focused, distracted gaze, wandering attention"
+}
+
+def build_enhanced_prototypes():
+    """
+    增强版原型构建：
+    1. 多文本描述融合
+    2. 负样本约束
+    3. 多原型聚类
+    """
     
     class_names = [c.strip() for c in open("class_names.txt", encoding='utf-8') if c.strip()]
-    if not class_names:
-        logger.error("class_names.txt 文件为空")
-        print("❌ 错误: class_names.txt 文件为空，请添加行为类别")
-        return False
+    logger.info(f"处理类别: {class_names}")
     
-    # 检查每个类别是否有对应的文件夹
-    missing_folders = []
+    model, preprocess = clip.load("ViT-B/32", device=DEVICE)
+    model.eval()
+    
+    root = "./images"
+    proto = {}
+    
     for c in class_names:
         path = os.path.join(root, c)
         if not os.path.exists(path):
-            missing_folders.append(c)
-        elif not os.listdir(path):
-            logger.warning(f"类别 '{c}' 的文件夹为空，请添加样本图片")
+            continue
+        
+        # 1. 提取图像特征
+        img_feats = []
+        valid_files = []
+        for f in os.listdir(path):
+            if f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                try:
+                    img = preprocess(Image.open(os.path.join(path, f))).unsqueeze(0).to(DEVICE)
+                    with torch.no_grad():
+                        feat = model.encode_image(img)
+                        feat = feat / feat.norm(dim=-1, keepdim=True)
+                        img_feats.append(feat.cpu())
+                        valid_files.append(f)
+                except:
+                    continue
+        
+        if len(img_feats) == 0:
+            continue
+            
+        img_feats = torch.cat(img_feats)
+        logger.info(f"{c}: {len(img_feats)} 张图片")
+        
+        # 2. 多文本描述特征（取平均）
+        descs = CLASS_DESCRIPTIONS_MULTI.get(c, [f"a student {c} in classroom"])
+        text_feats = []
+        for desc in descs:
+            tokens = clip.tokenize([desc]).to(DEVICE)
+            with torch.no_grad():
+                tf = model.encode_text(tokens)
+                tf = tf / tf.norm(dim=-1, keepdim=True)
+                text_feats.append(tf.cpu())
+        text_feat = torch.cat(text_feats).mean(dim=0, keepdim=True)
+        
+        # 3. 负样本约束（降低与负描述的相似度）
+        neg_desc = NEGATIVE_DESCRIPTIONS.get(c, "")
+        if neg_desc:
+            neg_tokens = clip.tokenize([neg_desc]).to(DEVICE)
+            with torch.no_grad():
+                neg_feat = model.encode_text(neg_tokens)
+                neg_feat = neg_feat / neg_feat.norm(dim=-1, keepdim=True)
+                neg_feat = neg_feat.cpu()
+        else:
+            neg_feat = None
+        
+        # 4. 图像聚类生成多原型（每个类别3-5个原型）
+        n_clusters = min(5, len(img_feats))
+        if n_clusters > 2:
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            kmeans.fit(img_feats.numpy())
+            centers = torch.from_numpy(kmeans.cluster_centers_).float()
+            centers = centers / centers.norm(dim=1, keepdim=True)
+        else:
+            centers = img_feats.mean(dim=0, keepdim=True)
+            centers = centers / centers.norm(dim=-1, keepdim=True)
+        
+        # 5. 融合策略：图像原型 + 文本引导 + 负样本约束
+        # 每个图像原型与文本特征融合
+        enhanced_protos = []
+        for i in range(centers.shape[0]):
+            img_p = centers[i:i+1]
+            
+            # 基础融合：图像 + 文本
+            combined = img_p + 0.4 * text_feat
+            
+            # 负样本约束：远离负描述（如果相似度高，则调整）
+            if neg_feat is not None:
+                neg_sim = torch.cosine_similarity(combined, neg_feat).item()
+                if neg_sim > 0.5:  # 如果与负描述太像，降低权重
+                    combined = combined - 0.2 * neg_feat
+            
+            combined = combined / combined.norm(dim=-1, keepdim=True)
+            enhanced_protos.append(combined)
+        
+        # 保存为多个原型（列表形式）
+        proto[c] = torch.cat(enhanced_protos).to(DEVICE)
+        logger.info(f"  生成 {len(enhanced_protos)} 个增强原型")
     
-    if missing_folders:
-        logger.error(f"缺少文件夹: {missing_folders}")
-        print(f"❌ 错误: 请在 ./images 目录下创建以下文件夹: {', '.join(missing_folders)}")
-        return False
+    # 保存
+    with open("prototypes.pkl", "wb") as f:
+        pickle.dump({"prototypes": proto, "class_names": class_names}, f)
     
-    return True, class_names
-
-def build_prototypes():
-    """生成少样本原型"""
-    try:
-        # 检查文件夹结构
-        success, class_names = check_image_folder()
-        if not success:
-            return False
-        
-        logger.info(f"开始为 {len(class_names)} 个类别生成原型: {class_names}")
-        
-        # 加载CLIP模型
-        model, pre = clip.load("ViT-B/32", device=DEVICE)
-        model.eval()
-        
-        # 生成图片原型
-        root = "./images"
-        proto = {}
-        
-        for c in class_names:
-            path = os.path.join(root, c)
-            feats = []
-            image_count = 0
-            
-            for f in os.listdir(path):
-                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff')):
-                    try:
-                        img_path = os.path.join(path, f)
-                        img = pre(Image.open(img_path)).unsqueeze(0).to(DEVICE)
-                        with torch.no_grad():
-                            feats.append(model.encode_image(img))
-                        image_count += 1
-                    except Exception as e:
-                        logger.warning(f"处理图片 {f} 失败: {str(e)}")
-                        continue
-            
-            if image_count == 0:
-                logger.warning(f"类别 '{c}' 没有有效图片，跳过")
-                continue
-            
-            if feats:
-                proto[c] = torch.mean(torch.cat(feats), dim=0, keepdim=True)
-                logger.info(f"类别 '{c}': 使用 {image_count} 张图片生成原型")
-            else:
-                logger.warning(f"类别 '{c}' 无法生成原型")
-        
-        if not proto:
-            logger.error("没有成功生成任何原型")
-            return False
-        
-        # 保存原型
-        with open("prototypes.pkl", "wb") as f:
-            pickle.dump({"prototypes": proto, "class_names": class_names}, f)
-        
-        print(f"✅ 少样本原型生成完成！共生成 {len(proto)} 个类别的原型")
-        print(f"📁 保存到: prototypes.pkl")
-        return True
-        
-    except Exception as e:
-        logger.error(f"原型生成失败: {str(e)}")
-        print(f"❌ 错误: {str(e)}")
-        return False
+    logger.info("✅ 增强原型生成完成")
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("儿童课堂异常行为检测系统 - 原型生成工具")
-    print("=" * 50)
-    
-    success = build_prototypes()
-    if not success:
-        print("请检查错误信息并修复后重试")
-        exit(1)
+    build_enhanced_prototypes()
