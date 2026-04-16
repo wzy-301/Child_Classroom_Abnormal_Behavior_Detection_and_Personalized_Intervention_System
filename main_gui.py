@@ -180,21 +180,19 @@ clip_model.eval()
 yolo = YOLO(YOLO_WEIGHT)
 
 def classify_crop(frame, box, use_class_specific=True):
-    """对裁剪区域进行分类"""
+    """保守分类策略 - 优先判为 normal"""
     try:
         x1, y1, x2, y2 = map(int, box)
-        
-        # 确保边界在图像范围内
         h, w = frame.shape[:2]
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
         
         if x2 <= x1 or y2 <= y1:
-            return "invalid_crop", 0
+            return "normal", 0
             
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
-            return "empty_crop", 0
+            return "normal", 0
             
         pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
         img = preprocess(pil).unsqueeze(0).to(DEVICE)
@@ -202,34 +200,57 @@ def classify_crop(frame, box, use_class_specific=True):
         with torch.no_grad():
             feat = clip_model.encode_image(img)
             feat = feat / feat.norm(dim=-1, keepdim=True)
-            
-        max_sim = -1
-        pred = "unknown"
-        for cls, proto in prototypes.items():
-            sim = torch.cosine_similarity(feat, proto.to(DEVICE)).item()
-            
-            if use_class_specific:
-                # 使用类别特定阈值
-                threshold = CLASS_THRESHOLDS.get(cls, SIM_THRES)
-                condition = sim > threshold
+        
+        # 计算与所有原型的相似度
+        similarities = {}
+        for cls, proto_tensor in prototypes.items():
+            if proto_tensor.dim() == 2 and proto_tensor.shape[0] > 1:
+                # 多原型：取最大
+                sims = torch.cosine_similarity(feat, proto_tensor.to(DEVICE))
+                sim = sims.max().item()
             else:
-                # 使用全局阈值
-                condition = sim > SIM_THRES
+                sim = torch.cosine_similarity(feat, proto_tensor.to(DEVICE)).item()
+            similarities[cls] = sim
+        
+        # 计算相似度
+        normal_sim = similarities.get("normal", 0)
+        phone_sim = similarities.get("play_phone", 0)
+        max_sim = max(similarities.values())
+        max_cls = max(similarities, key=similarities.get)
+    
+        # 1. 如果 normal 与stand相似度差距 < 0.1，且stand相似度小于0.80,优先判为 normal
+        if max_cls == "stand" and max_sim - normal_sim < 0.10 and max_sim < 0.80:
+            return "normal", normal_sim
+    
+        # 2. play_phone 必须比 normal 高至少 0.1，且绝对值 > 0.35
+        if max_cls == "play_phone":
+            if abs(phone_sim - normal_sim) < 0.08:
+                return "normal", normal_sim
+            if phone_sim - normal_sim < 0.10:  # 差距不够大
+                return "normal", normal_sim
+            if phone_sim < 0.35:  # 置信度不够高
+                return "normal", normal_sim
+        
+        # 3. 异常类必须超过各自的高阈值
+        thresholds = {
+            "normal": 0.15,
+            "lie": 0.15,        
+            "stand": 0.30,      
+            "play_phone": 0.35, 
+            "fight": 0.20,      
+            "whispering": 0.25, 
+            "looking_around": 0.25  
+        }
+        
+        threshold = thresholds.get(max_cls, 0.35)
+        
+        if max_sim > threshold:
+            return max_cls, max_sim
+        else:
+            return "normal", normal_sim
             
-            # 满足阈值条件且相似度更高
-            if condition and sim > max_sim:
-                max_sim = sim
-                pred = cls
-        
-        # 如果没有满足阈值的类别
-        if pred == "unknown":
-            return "unknown", 0
-                
-        return pred, max_sim
-        
     except Exception as e:
-        logger.error(f"分类异常: {str(e)}")
-        return "error", 0
+        return "normal", 0
 
 def detect_and_draw(frame, conf_thres=CONF_THRES, sim_thres=SIM_THRES, use_class_specific=True):
     """检测并绘制结果"""
