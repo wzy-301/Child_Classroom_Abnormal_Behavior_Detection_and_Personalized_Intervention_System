@@ -38,6 +38,7 @@
 
 ## 目录结构
 .
+
 ├── build_prototype.py      # 增强原型生成脚本
 
 ├── main_gui.py            # 主GUI程序
@@ -86,21 +87,37 @@ looking_around
 
 在 `./images` 目录下创建对应的文件夹，并放入示例图片：
 ./images/
+
 ├── normal/
+
 │ ├── student1.jpg
+
 │ └── student2.jpg
+
 ├── lie/
+
 │ ├── lie1.jpg
+
 │ └── lie2.jpg
+
 ├── stand/
+
 │ └── ...
+
 ├── play_phone/
+
 │ └── ...
+
 └── fight/
+
 └── ...
+
 ├── whispering/
+
 │ └── ...
+
 └── looking_around/
+
 └── ...
 
 ### 2. 生成原型
