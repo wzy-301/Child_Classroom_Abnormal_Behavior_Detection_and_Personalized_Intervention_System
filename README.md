@@ -58,19 +58,12 @@
 └── session_history.json  # 会话历史(生成)
 
 └── images/               # 训练图片目录
-
     ├── normal/           # 正常行为图片
-
     ├── lie/              # 趴桌行为图片
-
     ├── stand/            # 站立行为图片
-
     ├── play_phone/       # 使用手机图片
-
     ├── fight/            # 打闹行为图片
-
     ├── whispering/       # 交头接耳图片
-    
     └── looking_around/   # 东张西望图片
 
 ## 使用说明
@@ -86,6 +79,7 @@ whispering
 looking_around
 
 在 `./images` 目录下创建对应的文件夹，并放入示例图片：
+
 ./images/
 
 ├── normal/
