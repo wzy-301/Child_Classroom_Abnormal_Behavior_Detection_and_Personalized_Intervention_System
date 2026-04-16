@@ -10,12 +10,12 @@ class ConfigManager:
                 "sim_thres": 0.25,
                 "cooldown": 3.0,
                 "class_thresholds": {
-                    "lie": 0.20,
+                    "lie": 0.15,
                     "stand": 0.30,
-                    "play_phone": 0.25,
+                    "play_phone": 0.35,
                     "fight": 0.20,
-                    "whispering": 0.28,
-                    "looking_around": 0.30,
+                    "whispering": 0.25,
+                    "looking_around": 0.25,
                     "normal": 0.15
                 }
             },
