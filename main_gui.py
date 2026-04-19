@@ -429,92 +429,384 @@ class MainWindow(QMainWindow):
         """初始化窗口"""
         width = config_manager.get("ui.window_width", 1300)
         height = config_manager.get("ui.window_height", 850)
-        self.setWindowTitle("儿童课堂异常行为检测系统")
+        self.setWindowTitle("儿童课堂异常行为检测与干预系统")
         self.setGeometry(100, 100, width, height)
         
     def initUI(self):
-        """初始化界面"""
-        main = QWidget()
-        self.setCentralWidget(main)
-        layout = QVBoxLayout(main)
-
-        # 视频显示区域
+        """初始化现代化界面 - 保留所有原有功能"""
+        # 设置全局样式
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f0f4f8;
+                font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+            }
+            QLabel {
+                font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+            }
+            QPushButton {
+                font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+            }
+        """)
+        
+        # 主窗口
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QHBoxLayout(main_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        # ========== 左侧导航栏（20%） ==========
+        left_panel = QWidget()
+        left_panel.setObjectName("left_panel")
+        left_panel.setStyleSheet("""
+            #left_panel {
+                background-color: #ffffff;
+                border-right: 1px solid #e0e6ed;
+            }
+        """)
+        left_panel.setMaximumWidth(250)
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(20, 20, 20, 20)
+        left_layout.setSpacing(12)
+        
+        # 标题
+        nav_title = QLabel("🎓 儿童课堂异常行为检测与干预系统")
+        nav_title.setStyleSheet("""
+            font-size: 18px;
+            font-weight: bold;
+            color: #2c3e50;
+            padding-bottom: 15px;
+            border-bottom: 3px solid #5bc0de;
+        """)
+        left_layout.addWidget(nav_title)
+        
+        # 导航按钮 - 保留所有原有功能
+        nav_buttons = [
+            ("📷 摄像头", self.open_cam),
+            ("🖼️ 图片检测", self.open_img),
+            ("🎬 视频保存", self.open_video_save),
+            ("⏹️ 停止检测", self.stop_all),
+            ("💾 保存图片", self.save_img),
+            ("🔄 重置统计", self.reset_stats),
+            ("📈 统计面板", self.show_statistics_panel),
+            ("📊 会话历史", self.show_session_history),
+            ("⚙️ 参数配置", self.open_config_dialog),
+            ("ℹ️ 关于系统", self.show_about_dialog),
+        ]
+        
+        for text, callback in nav_buttons:
+            btn = QPushButton(text)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #5bc0de;
+                    color: white;
+                    border: none;
+                    border-radius: 8px;
+                    padding: 10px 18px;
+                    font-size: 13px;
+                    font-weight: 500;
+                    text-align: left;
+                    min-height: 40px;
+                }
+                QPushButton:hover {
+                    background-color: #46b8da;
+                }
+                QPushButton:pressed {
+                    background-color: #31b0d5;
+                }
+            """)
+            btn.clicked.connect(callback)
+            left_layout.addWidget(btn)
+        
+        left_layout.addStretch()
+        
+        # 版本信息
+        version_label = QLabel("v1.1.0 | 儿童课堂异常行为检测与干预系统")
+        version_label.setStyleSheet("color: #a0aec0; font-size: 11px;")
+        version_label.setAlignment(Qt.AlignCenter)
+        version_label.setWordWrap(True)
+        left_layout.addWidget(version_label)
+        
+        main_layout.addWidget(left_panel, stretch=2)
+        
+        # ========== 中间主区域（55%） ==========
+        center_panel = QWidget()
+        center_panel.setStyleSheet("background-color: #f8fafc;")
+        center_layout = QVBoxLayout(center_panel)
+        center_layout.setContentsMargins(20, 20, 20, 20)
+        center_layout.setSpacing(15)
+        
+        # 顶部控制栏 - 包含原有参数
+        control_bar = QWidget()
+        control_bar.setStyleSheet("""
+            background-color: #ffffff;
+            border-radius: 10px;
+            border: 1px solid #e0e6ed;
+        """)
+        control_layout = QHBoxLayout(control_bar)
+        control_layout.setContentsMargins(15, 15, 15, 15)
+        
+        # 置信度滑块（原有功能）
+        conf_layout = QHBoxLayout()
+        conf_label = QLabel("置信度 (Conf):")
+        conf_label.setStyleSheet("font-size: 13px; color: #4a5568; font-weight: 500;")
+        self.conf_slider = QSlider(Qt.Horizontal)
+        self.conf_slider.setRange(10, 90)
+        self.conf_slider.setValue(int(self.conf_thres * 100))
+        self.conf_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 6px;
+                background: #e0e6ed;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #5bc0de;
+                width: 16px;
+                height: 16px;
+                border-radius: 8px;
+                margin: -5px 0;
+            }
+            QSlider::sub-page:horizontal {
+                background: #5bc0de;
+                border-radius: 3px;
+            }
+        """)
+        self.conf_value = QLabel(f"{self.conf_thres:.2f}")
+        self.conf_value.setStyleSheet("font-size: 13px; color: #5bc0de; font-weight: bold; min-width: 35px;")
+        self.conf_slider.valueChanged.connect(lambda v: self.conf_value.setText(f"{v/100:.2f}"))
+        
+        conf_layout.addWidget(conf_label)
+        conf_layout.addWidget(self.conf_slider)
+        conf_layout.addWidget(self.conf_value)
+        control_layout.addLayout(conf_layout, stretch=2)
+        
+        # 交并比滑块（新增但有用）
+        iou_layout = QHBoxLayout()
+        iou_label = QLabel("交并比 (IoU):")
+        iou_label.setStyleSheet("font-size: 13px; color: #4a5568; font-weight: 500;")
+        self.iou_slider = QSlider(Qt.Horizontal)
+        self.iou_slider.setRange(10, 90)
+        self.iou_slider.setValue(50)
+        self.iou_slider.setStyleSheet(self.conf_slider.styleSheet())
+        self.iou_value = QLabel("0.50")
+        self.iou_value.setStyleSheet("font-size: 13px; color: #5bc0de; font-weight: bold; min-width: 35px;")
+        self.iou_slider.valueChanged.connect(lambda v: self.iou_value.setText(f"{v/100:.2f}"))
+        
+        iou_layout.addWidget(iou_label)
+        iou_layout.addWidget(self.iou_slider)
+        iou_layout.addWidget(self.iou_value)
+        control_layout.addLayout(iou_layout, stretch=2)
+        
+        # 检测信息卡片
+        info_card = QWidget()
+        info_card.setStyleSheet("""
+            background-color: #f7fafc;
+            border-radius: 8px;
+            border: 1px solid #e2e8f0;
+        """)
+        info_layout = QHBoxLayout(info_card)
+        info_layout.setContentsMargins(15, 10, 15, 10)
+        
+        self.time_label = QLabel("⏱️ 检测耗时: 0.00s")
+        self.time_label.setStyleSheet("font-size: 12px; color: #4a5568;")
+        self.target_label = QLabel("🎯 检测目标: 0个")
+        self.target_label.setStyleSheet("font-size: 12px; color: #4a5568;")
+        self.status = QLabel("⏹️ 已停止")
+        self.status.setStyleSheet("font-size: 12px; color: #fc8181; font-weight: bold;")
+        
+        info_layout.addWidget(self.time_label)
+        info_layout.addWidget(self.target_label)
+        info_layout.addWidget(self.status)
+        control_layout.addWidget(info_card, stretch=2)
+        
+        center_layout.addWidget(control_bar)
+        
+        # 视频显示区域（原有）
+        video_container = QWidget()
+        video_container.setStyleSheet("""
+            background-color: #ffffff;
+            border-radius: 12px;
+            border: 2px solid #e0e6ed;
+            padding: 10px;
+        """)
+        video_layout = QVBoxLayout(video_container)
+        video_layout.setContentsMargins(10, 10, 10, 10)
+        
         self.label = QLabel()
         self.label.setAlignment(Qt.AlignCenter)
-        self.label.setMinimumHeight(500)
-        self.label.setStyleSheet("background-color: #f0f0f0; border: 1px solid #ccc;")
-        layout.addWidget(self.label)
-
-        # 按钮区域
-        btn_layout = QHBoxLayout()
-        self.btn_cam = QPushButton("📷 摄像头")
-        self.btn_img = QPushButton("🖼️ 图片检测")
-        self.btn_video = QPushButton("🎬 视频保存")
-        self.btn_stop = QPushButton("⏹️ 停止")
-        self.btn_save = QPushButton("💾 保存图片")
-        self.btn_reset = QPushButton("🔄 重置统计")
-        self.btn_stats_panel = QPushButton("📈 统计面板")
-        self.btn_history = QPushButton("📊 会话历史")
-        self.btn_config = QPushButton("⚙️ 参数配置")
-        self.btn_about = QPushButton("ℹ️ 关于")
+        self.label.setMinimumHeight(400)
+        self.label.setStyleSheet("""
+            background-color: #f0f4f8;
+            border-radius: 8px;
+            border: 2px dashed #cbd5e0;
+            color: #a0aec0;
+            font-size: 16px;
+        """)
+        self.label.setText("<div align='center'>📹 实时检测画面<br/><br/>请选择图片、视频或开启摄像头</div>")
+        video_layout.addWidget(self.label)
         
-        # 设置按钮样式
-        for btn in [self.btn_cam, self.btn_img, self.btn_video, self.btn_stop, 
-                    self.btn_save, self.btn_reset, self.btn_stats_panel, 
-                    self.btn_history, self.btn_config, self.btn_about]:
-            btn.setMinimumHeight(35)
+        center_layout.addWidget(video_container, stretch=1)
         
-        btn_layout.addWidget(self.btn_cam)
-        btn_layout.addWidget(self.btn_img)
-        btn_layout.addWidget(self.btn_video)
-        btn_layout.addWidget(self.btn_stop)
-        btn_layout.addWidget(self.btn_save)
-        btn_layout.addWidget(self.btn_reset)
-        btn_layout.addWidget(self.btn_stats_panel)
-        btn_layout.addWidget(self.btn_history)
-        btn_layout.addWidget(self.btn_config)
-        btn_layout.addWidget(self.btn_about)
-        layout.addLayout(btn_layout)
-
-        # 进度条
+        # 进度条（原有）
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
-
-        # 统计信息
-        self.stat_label = QLabel("📊 异常行为统计：暂无数据")
-        self.stat_label.setStyleSheet("font-weight: bold; padding: 5px;")
-        layout.addWidget(self.stat_label)
-
-        # 状态栏
-        status_layout = QHBoxLayout()
-        self.status = QLabel("就绪")
-        self.fps_label = QLabel("FPS: --")
-        self.fps_label.setStyleSheet("color: #666;")
-        status_layout.addWidget(self.status)
-        status_layout.addStretch()
-        status_layout.addWidget(self.fps_label)
-        layout.addLayout(status_layout)
-
-        # 连接信号
-        self.btn_cam.clicked.connect(self.open_cam)
-        self.btn_img.clicked.connect(self.open_img)
-        self.btn_video.clicked.connect(self.open_video_save)
-        self.btn_stop.clicked.connect(self.stop_all)
-        self.btn_save.clicked.connect(self.save_img)
-        self.btn_reset.clicked.connect(self.reset_stats)
-        self.btn_stats_panel.clicked.connect(self.show_statistics_panel)
-        self.btn_history.clicked.connect(self.show_session_history)
-        self.btn_config.clicked.connect(self.open_config_dialog)
-        self.btn_about.clicked.connect(self.show_about_dialog)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                background-color: #e0e6ed;
+                border-radius: 5px;
+                height: 8px;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #5bc0de;
+                border-radius: 5px;
+            }
+        """)
+        center_layout.addWidget(self.progress_bar)
         
-        # 初始化变量
+        # 统计信息标签（原有，移到中间底部）
+        self.stat_label = QLabel("📊 异常行为统计：暂无数据")
+        self.stat_label.setTextFormat(Qt.RichText)  
+        self.stat_label.setWordWrap(True)  # 自动换行
+        self.stat_label.setStyleSheet("""
+            background-color: #ffffff;
+            border-radius: 8px;
+            padding: 12px 15px;
+            border: 1px solid #e0e6ed;
+            font-size: 13px;
+            font-weight: bold;
+            color: #4a5568;
+        """)
+        center_layout.addWidget(self.stat_label)
+        
+        main_layout.addWidget(center_panel, stretch=5)
+        
+        # ========== 右侧面板（25%） ==========
+        right_panel = QWidget()
+        right_panel.setStyleSheet("background-color: #ffffff; border-left: 1px solid #e0e6ed;")
+        right_panel.setMaximumWidth(350)
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(20, 20, 20, 20)
+        right_layout.setSpacing(15)
+        
+        # 系统标题
+        system_title = QWidget()
+        system_title.setStyleSheet("""
+            background-color: #f7fafc;
+            border-radius: 10px;
+            border: 1px solid #e2e8f0;
+        """)
+        system_layout = QHBoxLayout(system_title)
+        system_layout.setContentsMargins(15, 15, 15, 15)
+        
+        icon_label = QLabel("🎯")
+        icon_label.setStyleSheet("font-size: 32px;")
+        title_text = QLabel("YOLO检测系统")
+        title_text.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50;")
+        
+        system_layout.addWidget(icon_label)
+        system_layout.addWidget(title_text)
+        system_layout.addStretch()
+        right_layout.addWidget(system_title)
+        
+        # 实时干预建议面板
+        advice_panel = QWidget()
+        advice_panel.setStyleSheet("""
+            background-color: #fffaf0;
+            border-radius: 10px;
+            border: 1px solid #fed7aa;
+            padding: 15px;
+        """)
+        advice_layout = QVBoxLayout(advice_panel)
+        advice_layout.setContentsMargins(0, 0, 0, 0)
+        advice_layout.setSpacing(10)
+
+        advice_title = QLabel("🚨 实时干预建议")
+        advice_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #c05621;")
+        advice_layout.addWidget(advice_title)
+
+        self.advice_text = QTextEdit()
+        self.advice_text.setReadOnly(True)
+        self.advice_text.setMinimumHeight(180)  # 设置最小高度
+        self.advice_text.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.advice_text.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.advice_text.setStyleSheet("""
+            QTextEdit {
+                background-color: #fff5eb;
+                border: none;
+                border-radius: 5px;
+                padding: 10px;
+                font-size: 12px;
+                line-height: 1.5;
+            }
+            QScrollBar:vertical {
+                background-color: #f0f0f0;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #cbd5e0;
+                border-radius: 6px;
+                min-height: 40px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #a0aec0;
+            }
+        """)
+        self.advice_text.setPlaceholderText("暂无异常行为...")
+        advice_layout.addWidget(self.advice_text, stretch=1)  # 添加 stretch 让它占据更多空间
+
+        # 当前异常列表
+        abnormal_title = QLabel("⚠️ 当前检测到的异常")
+        abnormal_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #9c4221; margin-top: 5px;")
+        advice_layout.addWidget(abnormal_title)
+
+        self.current_abnormal_list = QListWidget()
+        self.current_abnormal_list.setMinimumHeight(120)  # 设置最小高度
+        self.current_abnormal_list.setStyleSheet("""
+            QListWidget {
+                background-color: #ffffff;
+                border: 1px solid #fed7aa;
+                border-radius: 5px;
+                padding: 5px;
+            }
+            QListWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid #feebc8;
+                color: #9c4221;
+                font-size: 11px;
+            }
+            QListWidget::item:selected {
+                background-color: #ed8936;
+                color: white;
+            }
+        """)
+        advice_layout.addWidget(self.current_abnormal_list, stretch=1)
+
+        right_layout.addWidget(advice_panel, stretch=3)  # 增加 stretch 权重
+        
+        # FPS显示（原有）
+        self.fps_label = QLabel("FPS: --")
+        self.fps_label.setStyleSheet("color: #a0aec0; font-size: 12px;")
+        self.fps_label.setAlignment(Qt.AlignRight)
+        right_layout.addWidget(self.fps_label)
+        
+        right_layout.addStretch()
+        
+        main_layout.addWidget(right_panel, stretch=3)
+        
+        # ========== 初始化所有原有变量 ==========
         self.thread = None
         self.current_frame = None
         self.current_session = None
         self.shown_behaviors = set()
         self.session_saved = False
         self.session_history = []
+        self.current_frame_abnormal = set()
+        self.detection_time = 0
+        
+        # 加载历史记录（原有功能）
+        self.load_history()
         
     def load_history(self):
         """加载历史记录"""
@@ -573,10 +865,24 @@ class MainWindow(QMainWindow):
                 logger.error(f"保存会话失败: {str(e)}")
                 
     def show_frame(self, frame, ab_set):
-        """显示帧图像"""
+        """显示帧图像 - 更新现代化界面"""
         start_time = time.time()
         
         self.current_frame = frame.copy()
+        self.current_frame_abnormal = ab_set
+        
+        # 更新状态标签
+        if ab_set and ab_set != {"normal"}:
+            self.status.setText("🔴 检测中 - 发现异常")
+            self.status.setStyleSheet("font-size: 12px; color: #fc8181; font-weight: bold;")
+        else:
+            self.status.setText("🟢 检测中 - 正常")
+            self.status.setStyleSheet("font-size: 12px; color: #48bb78; font-weight: bold;")
+        
+        # 更新目标数
+        self.target_label.setText(f"🎯 检测目标: {len(ab_set)}个")
+        
+        # 原有显示代码...
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bpl = ch * w
@@ -584,13 +890,21 @@ class MainWindow(QMainWindow):
         self.label.setPixmap(QPixmap.fromImage(q_img).scaled(
             self.label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
-        # 更新统计
+        # 更新干预建议面板
+        self.update_advice_panel(ab_set)
+        
+        # 更新统计（原有代码）
+        new_abnormal = False
         for ab in ab_set:
             if self.stat_manager.update(ab, self.cooldown):
+                new_abnormal = True
                 if ab not in self.shown_behaviors:
                     self.shown_behaviors.add(ab)
                     self.log_behavior(ab)
-                    QMessageBox.information(self, "干预建议", INTERVENTION_MAP[ab])
+        
+        # 显示合并弹窗（原有代码）
+        if new_abnormal and ab_set:
+            self.show_merged_intervention_dialog(ab_set)
         
         self.update_stat()
         
@@ -600,24 +914,214 @@ class MainWindow(QMainWindow):
         self.performance_monitor.add_frame_time(process_time)
         stats = self.performance_monitor.get_stats()
         self.fps_label.setText(f"FPS: {stats['current_fps']:.1f}")
+        self.time_label.setText(f"⏱️ 检测耗时: {process_time/1000:.2f}s")
+
+
+    def update_advice_panel(self, ab_set):
+        """更新右侧干预建议面板"""
+        # 清空当前异常列表
+        self.current_abnormal_list.clear()
+        
+        if not ab_set or ab_set == {"normal"}:
+            # 无异常
+            self.advice_text.setHtml("""
+                <div style="color: #5cb85c; text-align: center; padding: 20px;">
+                    <h3>✅ 课堂秩序良好</h3>
+                    <p>当前未检测到异常行为</p>
+                    <p>所有学生专注学习</p>
+                </div>
+            """)
+            self.current_abnormal_list.addItem("无异常")
+            self.current_abnormal_list.item(0).setForeground(QColor("#5cb85c"))
+            return
+        
+        # 构建干预建议文本
+        advice_html = "<div style=\"padding: 10px;\">"
+        advice_html += "<h3 style=\"color: #d9534f; margin-bottom: 15px;\">⚠️ 检测到异常行为</h3>"
+        
+        for ab in sorted(ab_set):
+            if ab == "normal":
+                continue
+                
+            # 添加到列表
+            item_text = f"{ab} ({datetime.now().strftime('%H:%M:%S')})"
+            self.current_abnormal_list.addItem(item_text)
+            
+            # 添加干预建议到文本区域
+            advice = INTERVENTION_MAP.get(ab, f"【注意】检测到 {ab} 行为")
+            advice_html += f"""
+                <div style="background-color: #f8d7da; border-left: 4px solid #d9534f; 
+                            padding: 10px; margin-bottom: 10px; border-radius: 4px;">
+                    <strong style="color: #721c24;">{ab}</strong><br/>
+                    <span style="color: #856404;">{advice}</span>
+                </div>
+            """
+        
+        advice_html += "</div>"
+        self.advice_text.setHtml(advice_html)
+
+
+    def show_merged_intervention_dialog(self, ab_set):
+        """显示合并的干预建议弹窗 - 修复布局"""
+        if not ab_set or ab_set == {"normal"}:
+            return
+        
+        # 构建合并的弹窗内容
+        title = f"干预建议 - 检测到 {len([ab for ab in ab_set if ab != 'normal'])} 项异常"
+        
+        # 创建自定义对话框而不是 QMessageBox
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setMinimumWidth(450)
+        dialog.setMaximumWidth(500)
+        
+        # 主布局
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # 标题区域（带图标）
+        title_layout = QHBoxLayout()
+        
+        # 警告图标
+        warning_icon = QLabel("⚠️")
+        warning_icon.setStyleSheet("font-size: 24px;")
+        title_layout.addWidget(warning_icon)
+        
+        # 标题文字
+        title_label = QLabel("检测到以下异常行为：")
+        title_label.setStyleSheet("""
+            font-size: 14px;
+            font-weight: bold;
+            color: #333;
+        """)
+        title_layout.addWidget(title_label)
+        title_layout.addStretch()
+        
+        layout.addLayout(title_layout)
+        
+        # 异常行为列表区域
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setMaximumHeight(300)
+        scroll_area.setStyleSheet("border: none;")
+        
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setSpacing(10)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        
+        for ab in sorted(ab_set):
+            if ab == "normal":
+                continue
+            
+            advice = INTERVENTION_MAP.get(ab, f"检测到 {ab}")
+            short_advice = advice.replace("【干预建议】", "").replace("【注意】", "")
+            
+            # 每个异常行为的卡片
+            card = QWidget()
+            card.setStyleSheet("""
+                QWidget {
+                    background-color: #f8d7da;
+                    border-left: 4px solid #d9534f;
+                    border-radius: 4px;
+                }
+            """)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(12, 10, 12, 10)
+            card_layout.setSpacing(5)
+            
+            # 行为类型标签
+            behavior_label = QLabel(f"<b>{ab}</b>")
+            behavior_label.setStyleSheet("color: #721c24; font-size: 13px;")
+            card_layout.addWidget(behavior_label)
+            
+            # 干预建议内容
+            advice_label = QLabel(short_advice)
+            advice_label.setStyleSheet("color: #856404; font-size: 12px;")
+            advice_label.setWordWrap(True)
+            card_layout.addWidget(advice_label)
+            
+            content_layout.addWidget(card)
+        
+        content_layout.addStretch()
+        scroll_area.setWidget(content_widget)
+        layout.addWidget(scroll_area)
+        
+        # 底部提示
+        hint_label = QLabel("请及时关注并处理上述情况")
+        hint_label.setStyleSheet("""
+            color: #666;
+            font-size: 12px;
+            margin-top: 10px;
+        """)
+        hint_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(hint_label)
+        
+        # 确定按钮
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        ok_btn = QPushButton("✓ 确定")
+        ok_btn.setStyleSheet("""
+            QPushButton {
+                padding: 10px 30px;
+                background-color: #5bc0de;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #46b8da;
+            }
+            QPushButton:pressed {
+                background-color: #31b0d5;
+            }
+        """)
+        ok_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addStretch()
+        
+        layout.addLayout(btn_layout)
+        
+        # 设置对话框样式
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #ffffff;
+            }
+        """)
+        
+        dialog.exec_()
         
     def update_stat(self):
-        """更新统计显示"""
+        """更新统计显示 - 现代化样式"""
         session_summary = self.stat_manager.get_session_summary()
         global_summary = self.stat_manager.get_global_summary()
         
-        # 创建统计文本
-        stat_text = "📊 行为统计\n"
-        stat_text += f"当前会话: {session_summary['total']} 次异常 | "
-        stat_text += f"历史累计: {global_summary['total']} 次异常\n"
+        # 使用 HTML 格式显示
+        html_text = f"""
+        <div style="line-height: 1.6; font-size: 13px;">
+            <b>📊 统计概览</b><br/>
+            当前会话: <span style="color: #5bc0de; font-weight: bold;">{session_summary['total']}</span> 次异常 | 
+            历史累计: <span style="color: #5bc0de; font-weight: bold;">{global_summary['total']}</span> 次异常
+        """
         
         if session_summary['by_behavior']:
-            stat_text += "\n当前会话异常分布:\n"
+            html_text += "<br/><br/><b>🔍 当前会话异常分布:</b>"
             for behavior, count in session_summary['by_behavior'].items():
                 percentage = (count / session_summary['total'] * 100) if session_summary['total'] > 0 else 0
-                stat_text += f"  • {behavior}: {count} 次 ({percentage:.1f}%)\n"
+                bar = "█" * int(percentage / 10)  # 进度条
+                html_text += f"""
+                <div style="margin: 5px 0;">
+                    {behavior}: <span style="color: #d9534f; font-weight: bold;">{count}次</span> 
+                    <span style="color: #888;">({percentage:.1f}%)</span> {bar}
+                </div>
+                """
         
-        self.stat_label.setText(stat_text)
+        html_text += "</div>"
+        self.stat_label.setText(html_text)
         
     def stop_all(self):
         """停止所有处理"""
@@ -629,8 +1133,10 @@ class MainWindow(QMainWindow):
             self.thread = None
         self.save_current_session()
         self.progress_bar.setVisible(False)
-        self.status.setText("已停止")
+        self.status.setText("⏹️ 已停止")
+        self.status.setStyleSheet("font-size: 12px; color: #a0aec0; font-weight: bold;")
         self.fps_label.setText("FPS: --")
+        self.time_label.setText("⏱️ 检测耗时: 0.00s")
         
     def open_cam(self):
         """打开摄像头"""
@@ -899,7 +1405,7 @@ class MainWindow(QMainWindow):
     def show_about_dialog(self):
         """显示关于对话框"""
         about_text = """
-        <h3>儿童课堂异常行为检测系统</h3>
+        <h3>儿童课堂异常行为检测与干预系统</h3>
         <p><b>版本:</b> 1.1.0</p>
         <p><b>技术架构:</b></p>
         <ul>
@@ -939,7 +1445,7 @@ class MainWindow(QMainWindow):
         <p>1. 使用前请运行 build_prototype.py 生成原型文件</p>
         <p>2. 首次使用会自动下载YOLOv8模型</p>
         <p>3. 建议在GPU环境下运行以获得最佳性能</p>
-        <p><i>© 2024 儿童课堂异常行为检测系统</i></p>
+        <p><i>© 2026 儿童课堂异常行为检测与干预系统</i></p>
         """
         
         QMessageBox.about(self, "关于", about_text)
