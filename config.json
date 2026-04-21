@@ -1,7 +1,7 @@
 {
   "detection": {
     "conf_thres": 0.35,
-    "sim_thres": 0.25,
+    "sim_thres": 0.35,
     "cooldown": 4.5,
     "class_thresholds": {
       "lie": 0.15,
@@ -14,12 +14,14 @@
     }
   },
   "ui": {
-    "window_width": 1390,
-    "window_height": 840,
+    "window_width": 1854,
+    "window_height": 1011,
     "theme": "light"
   },
   "paths": {
     "yolo_weight": "yolov8s.pt",
-    "prototype_path": "prototypes.pkl"
+    "prototype_path": "prototypes.pkl",
+    "protonet_model": "protonet_model.pth",
+    "protonet_prototypes": "protonet_prototypes.pth"
   }
 }
