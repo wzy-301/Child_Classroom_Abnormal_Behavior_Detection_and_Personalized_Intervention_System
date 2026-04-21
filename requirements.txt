@@ -6,3 +6,4 @@ ultralytics>=8.0.0
 numpy>=1.24.0
 Pillow>=10.0.0
 PyQt5>=5.15.0
+tqdm>=4.65.0
