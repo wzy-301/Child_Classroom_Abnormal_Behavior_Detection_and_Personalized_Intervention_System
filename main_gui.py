@@ -1,6 +1,7 @@
 import sys
 import cv2
 import torch
+import torch.nn as nn
 import clip
 import pickle
 import numpy as np
@@ -16,6 +17,7 @@ from threading import Lock
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
+from torchvision import models, transforms
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -34,10 +36,77 @@ PROTOTYPE_PATH = config_manager.get("paths.prototype_path", "prototypes.pkl")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# ========== Prototypical Networks 全局变量 ==========
+PROTOTYPICAL_MODEL = None
+PROTOTYPES_PROTO = None  # 改名避免冲突
+CLASS_NAMES_PROTO = None
+USE_PROTONET = False
+
+transform_proto = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# ========== Prototypical Networks 模型定义 ==========
+
+class PrototypicalNetwork(nn.Module):
+    """原型网络 - 少样本学习核心模型"""
+    def __init__(self, feature_dim=128):
+        super().__init__()
+        backbone = models.efficientnet_b0(weights=None)
+        self.encoder = backbone.features
+        self.projector = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(1280, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, feature_dim)
+        )
+        self.feature_dim = feature_dim
+        
+    def forward(self, x):
+        features = self.encoder(x)
+        embeddings = self.projector(features)
+        embeddings = nn.functional.normalize(embeddings, p=2, dim=1)
+        return embeddings
+
+def load_protonet_model():
+    """加载 Prototypical Networks 模型和原型"""
+    global PROTOTYPICAL_MODEL, PROTOTYPES_PROTO, CLASS_NAMES_PROTO, USE_PROTONET
+    
+    try:
+        if not os.path.exists('protonet_model.pth'):
+            logger.warning("protonet_model.pth 不存在，将使用 CLIP 方案")
+            return False
+        if not os.path.exists('protonet_prototypes.pth'):
+            logger.warning("protonet_prototypes.pth 不存在，将使用 CLIP 方案")
+            return False
+        
+        model = PrototypicalNetwork(feature_dim=128)
+        model.load_state_dict(torch.load('protonet_model.pth', map_location=DEVICE))
+        model = model.to(DEVICE)
+        model.eval()
+        PROTOTYPICAL_MODEL = model
+        
+        proto_data = torch.load('protonet_prototypes.pth', map_location=DEVICE)
+        PROTOTYPES_PROTO = proto_data['prototypes']
+        CLASS_NAMES_PROTO = proto_data['class_names']
+        USE_PROTONET = True
+        
+        logger.info(f"Prototypical Networks 加载成功: {len(CLASS_NAMES_PROTO)} 个类别")
+        return True
+        
+    except Exception as e:
+        logger.error(f"加载 Prototypical Networks 失败: {e}")
+        USE_PROTONET = False
+        return False
+
 # 干预建议映射
 INTERVENTION_MAP = {
     "lie": "【干预建议】学生趴桌，提醒端正坐姿，保持专注",
-    "stand": "【注意】检测到学生站立，请确认：\n1. 是否经允许回答问题\n2. 是否擅自离座\n3. 是否小组活动需要",
+    "stand": "【注意】检测到学生站立，请确认：\\n1. 是否经允许回答问题\\n2. 是否擅自离座\\n3. 是否小组活动需要",
     "play_phone": "【干预建议】发现使用手机，提醒收起电子设备",
     "fight": "【干预建议】发现打闹行为，立即制止，维持课堂安全",
     "whispering": "【干预建议】检测到交头接耳，请提醒保持安静，专注听讲",
@@ -47,13 +116,13 @@ INTERVENTION_MAP = {
 
 # 类别特定阈值
 CLASS_THRESHOLDS = {
-    "lie": 0.20,          # 趴桌特征明显，可降低阈值
-    "stand": 0.30,        # 站立容易误判，提高阈值
-    "play_phone": 0.25,   # 保持默认
-    "fight": 0.20,        # 打闹特征明显
-    "whispering": 0.28,   # 交头接耳
-    "looking_around": 0.30, # 东张西望
-    "normal": 0.15,       # 正常行为阈值较低
+    "lie": 0.20,
+    "stand": 0.30,
+    "play_phone": 0.25,
+    "fight": 0.20,
+    "whispering": 0.28,
+    "looking_around": 0.30,
+    "normal": 0.15,
 }
 
 class StatisticsManager:
@@ -157,8 +226,8 @@ def check_required_files():
             missing_files.append(file_path)
     
     if missing_files:
-        error_msg = f"缺少必要文件：{', '.join(missing_files)}\n"
-        error_msg += "请确保：\n1. 已运行 build_prototype.py 生成 prototypes.pkl\n"
+        error_msg = f"缺少必要文件：{', '.join(missing_files)}\\n"
+        error_msg += "请确保：\\n1. 已运行 build_prototype.py 生成 prototypes.pkl\\n"
         error_msg += "2. 已下载 yolov8s.pt 模型文件到当前目录"
         return False, error_msg
     
@@ -179,8 +248,10 @@ clip_model, preprocess = clip.load("ViT-B/32", device=DEVICE)
 clip_model.eval()
 yolo = YOLO(YOLO_WEIGHT)
 
+# ========== 分类函数 ==========
+
 def classify_crop(frame, box, use_class_specific=True):
-    """保守分类策略 - 优先判为 normal"""
+    """CLIP 分类 - 作为备用方案"""
     try:
         x1, y1, x2, y2 = map(int, box)
         h, w = frame.shape[:2]
@@ -200,82 +271,257 @@ def classify_crop(frame, box, use_class_specific=True):
         with torch.no_grad():
             feat = clip_model.encode_image(img)
             feat = feat / feat.norm(dim=-1, keepdim=True)
-        
-        # 计算与所有原型的相似度
-        similarities = {}
-        for cls, proto_tensor in prototypes.items():
-            if proto_tensor.dim() == 2 and proto_tensor.shape[0] > 1:
-                # 多原型：取最大
-                sims = torch.cosine_similarity(feat, proto_tensor.to(DEVICE))
-                sim = sims.max().item()
-            else:
-                sim = torch.cosine_similarity(feat, proto_tensor.to(DEVICE)).item()
-            similarities[cls] = sim
-        
-        # 计算相似度
-        normal_sim = similarities.get("normal", 0)
-        phone_sim = similarities.get("play_phone", 0)
-        max_sim = max(similarities.values())
-        max_cls = max(similarities, key=similarities.get)
-    
-        # 1. 如果 normal 与stand相似度差距 < 0.1，且stand相似度小于0.80,优先判为 normal
-        if max_cls == "stand" and max_sim - normal_sim < 0.10 and max_sim < 0.80:
-            return "normal", normal_sim
-    
-        # 2. play_phone 必须比 normal 高至少 0.1，且绝对值 > 0.35
-        if max_cls == "play_phone":
-            if abs(phone_sim - normal_sim) < 0.08:
-                return "normal", normal_sim
-            if phone_sim - normal_sim < 0.10:  # 差距不够大
-                return "normal", normal_sim
-            if phone_sim < 0.35:  # 置信度不够高
-                return "normal", normal_sim
-        
-        # 3. 异常类必须超过各自的高阈值
-        thresholds = {
-            "normal": 0.15,
-            "lie": 0.15,        
-            "stand": 0.30,      
-            "play_phone": 0.35, 
-            "fight": 0.20,      
-            "whispering": 0.25, 
-            "looking_around": 0.25  
-        }
-        
-        threshold = thresholds.get(max_cls, 0.35)
-        
-        if max_sim > threshold:
-            return max_cls, max_sim
-        else:
-            return "normal", normal_sim
             
+        max_sim = -1
+        pred = "unknown"
+        for cls, proto in prototypes.items():
+            sim = torch.cosine_similarity(feat, proto.to(DEVICE)).item()
+            threshold = CLASS_THRESHOLDS.get(cls, SIM_THRES)
+            condition = sim > threshold
+            if condition and sim > max_sim:
+                max_sim = sim
+                pred = cls
+        
+        if pred == "unknown":
+            return "normal", 0
+                
+        return pred, max_sim
+        
     except Exception as e:
+        logger.error(f"分类异常: {str(e)}")
         return "normal", 0
 
-def detect_and_draw(frame, conf_thres=CONF_THRES, sim_thres=SIM_THRES, use_class_specific=True):
-    """检测并绘制结果"""
-    current_abnormal = set()
+def classify_crop_protonet(frame, box):
+    """终极修复版 - 彻底解决 play_phone 误判"""
     try:
-        results = yolo(frame, classes=[0], conf=conf_thres)
-        for r in results:
+        if PROTOTYPICAL_MODEL is None or PROTOTYPES_PROTO is None:
+            cls, sim = classify_crop(frame, box)
+            return cls, sim, None
+        
+        x1, y1, x2, y2 = map(int, box)
+        h, w = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        
+        if x2 <= x1 or y2 <= y1:
+            return "normal", 0, None
+            
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return "normal", 0, None
+        
+        pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+        img = transform_proto(pil).unsqueeze(0).to(DEVICE)
+        
+        with torch.no_grad():
+            feat = PROTOTYPICAL_MODEL(img)
+            feat = feat / feat.norm(dim=-1, keepdim=True)
+        
+        similarities = {}
+        for cls_name, proto in PROTOTYPES_PROTO.items():
+            proto = proto.to(DEVICE)
+            dist = torch.cdist(feat, proto).item()
+            sim = np.exp(-dist**2 / (2 * 0.5**2))
+            similarities[cls_name] = sim
+        
+        # ========== 核心修复逻辑 ==========
+        normal_sim = similarities.get("normal", 0)
+        # phone_sim = similarities.get("play_phone", 0)
+        
+        # 修复1: 对 play_phone 打5折（因为没有手机验证）
+        if "play_phone" in similarities:
+            similarities["play_phone"] *= 0.5
+            # phone_sim = similarities["play_phone"]
+        
+        # 修复2: 如果 normal >= 0.2，且最高异常类只比 normal 高一点点（<0.12），选 normal
+        if normal_sim >= 0.2:
+            best_abnormal_sim = 0
+            for cls in ["lie", "stand", "play_phone", "fight", "whispering", "looking_around"]:
+                if similarities.get(cls, 0) > best_abnormal_sim:
+                    best_abnormal_sim = similarities[cls]
+            
+            if best_abnormal_sim - normal_sim < 0.12:
+                return "normal", normal_sim, similarities
+        
+        # 修复3: play_phone 打折后仍然是所有类别中最高的
+        current_best = max(similarities, key=similarities.get)
+        
+        if current_best == "play_phone":
+            # 找到第二高的类别（排除 play_phone）
+            second_best = None
+            second_sim = 0
+            for c, s in similarities.items():
+                if c != "play_phone" and s > second_sim:
+                    second_sim = s
+                    second_best = c
+            
+            # 如果第二高只比 normal 高一点点（<0.1），说明整体不确定，选 normal
+            if second_best and (second_sim - normal_sim < 0.1):
+                return "normal", normal_sim, similarities
+            
+            # 否则，第二高可能是其他真实异常（lie/stand等），选第二高
+            elif second_best:
+                return second_best, second_sim, similarities
+            
+            # 如果没有第二高（理论上不会发生），选 normal
+            else:
+                return "normal", normal_sim, similarities
+        
+        # 找最大值（此时 play_phone 已经被处理过）
+        pred = max(similarities, key=similarities.get)
+        max_sim = similarities[pred]
+        
+        # 阈值判断
+        thresholds = {
+            "normal": 0.25, "lie": 0.35, "stand": 0.40,
+            "play_phone": 0.45, "fight": 0.35,
+            "whispering": 0.38, "looking_around": 0.38
+        }
+        
+        if max_sim < thresholds.get(pred, 0.35):
+            pred = "normal"
+            max_sim = normal_sim
+        
+        return pred, max_sim, similarities
+        
+    except Exception as e:
+        cls, sim = classify_crop(frame, box)
+        return cls, sim, None
+
+def detect_and_draw(frame, conf_thres=CONF_THRES, sim_thres=SIM_THRES, iou_thres=0.50, use_class_specific=True):
+    """检测并绘制结果 - 结合手机目标检测 + Prototypical Networks（最终修复版）"""
+    current_abnormal = set()
+    
+    try:
+        # ========== 步骤1: 检测所有人 ==========
+        person_results = yolo(frame, classes=[0], conf=conf_thres, iou=iou_thres, verbose=False)
+
+        # ===== 添加调试打印 =====
+        phone_results = yolo(frame, classes=[67], conf=0.25, verbose=False)
+        phone_count = sum(len(r.boxes) for r in phone_results)
+        # print(f"【调试】检测到手机数量: {phone_count}")  # 看这个数字是不是一直是0
+        
+        phone_boxes = []
+        for r in phone_results:
             for box in r.boxes.xyxy:
-                cls_name, sim = classify_crop(frame, box, use_class_specific)
+                phone_boxes.append(box.cpu().numpy())
+        # =======================
+        
+        # ========== 步骤2: 检测手机/电子设备 ==========
+        phone_boxes = []
+        try:
+            phone_results = yolo(frame, classes=[67], conf=0.25, verbose=False)
+            for r in phone_results:
+                for box in r.boxes.xyxy:
+                    phone_boxes.append(box.cpu().numpy())
+        except Exception as e:
+            logger.debug(f"手机检测跳过: {e}")
+        
+        # ========== 步骤3: 对每个人进行分类 ==========
+        for r in person_results:
+            for box in r.boxes.xyxy:
+                x1, y1, x2, y2 = map(int, box)
+                h_frame, w_frame = frame.shape[:2]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w_frame, x2), min(h_frame, y2)
+                
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                
+                # 计算人体信息
+                person_cx = (x1 + x2) / 2
+                person_cy = (y1 + y2) / 2
+                person_height = y2 - y1
+                
+                # ========== 步骤4: 检查此人附近是否有手机 ==========
+                has_phone_nearby = False
+                nearest_phone_dist = float('inf')
+                
+                for pb in phone_boxes:
+                    px1, py1, px2, py2 = pb
+                    phone_cx = (px1 + px2) / 2
+                    phone_cy = (py1 + py2) / 2
+                    dist = ((person_cx - phone_cx) ** 2 + (person_cy - phone_cy) ** 2) ** 0.5
+                    
+                    if dist < person_height * 0.7:
+                        if py1 > y1 + person_height * 0.2 and py2 < y1 + person_height * 0.85:
+                            has_phone_nearby = True
+                            nearest_phone_dist = min(nearest_phone_dist, dist)
+                
+                # ========== 步骤5: 分类决策（最终修复版） ==========
+                
+                if has_phone_nearby:
+                    # ✅ 附近检测到手机 → 直接判定为 play_phone
+                    cls_name = "play_phone"
+                    sim = min(0.95, 0.75 + 0.2 * (1 - nearest_phone_dist / (person_height * 0.7)))
+                    source = "phone_detect"  # 标记来源
+                    # print(f"【调试】手机检测触发! 判为 play_phone")
+                    
+                else:
+                    # 附近没有手机 → 用模型判断
+                    if USE_PROTONET:
+                        cls_name, sim, all_sims = classify_crop_protonet(frame, [x1, y1, x2, y2])
+                        # print(f"【调试】Protonet 结果: {cls_name}, 分数: {all_sims}")
+                    else:
+                        cls_name, sim = classify_crop(frame, [x1, y1, x2, y2], use_class_specific)
+                        all_sims = None
+                    
+                    source = "model"
+                    
+                    # ✅ 关键修复：如果最高置信度是 play_phone 但没检测到手机
+                    # 选择置信度第二高的类别（排除 play_phone）
+                    if cls_name == "play_phone" and all_sims is not None:
+                        # 排除 play_phone，找第二高的
+                        second_best = None
+                        second_sim = 0
+                        for c, s in all_sims.items():
+                            if c != "play_phone" and s > second_sim:
+                                second_sim = s
+                                second_best = c
+                        
+                        # 如果第二高与 play_phone 差距不大（< 0.15），选第二高
+                        if second_best and (all_sims["play_phone"] - second_sim < 0.15):
+                            cls_name = second_best
+                            sim = second_sim
+                            source = "model_fallback"  # 标记为降级选择
+                
+                # 过滤无效类别
                 if cls_name not in CLASS_NAMES:
                     continue
-
-                # 判断是否为异常行为
+                
+                # ========== 步骤6: 绘制结果 ==========
                 is_abnormal = cls_name != "normal"
                 if is_abnormal:
                     current_abnormal.add(cls_name)
                 
-                # 绘制边界框和标签
-                x1, y1, x2, y2 = map(int, box)
-                color = (0, 0, 255) if is_abnormal else (0, 255, 0)
+                # 选择颜色
+                if cls_name == "play_phone":
+                    color = (0, 165, 255)  # 橙色
+                elif is_abnormal:
+                    color = (0, 0, 255)    # 红色
+                else:
+                    color = (0, 255, 0)    # 绿色
+                
+                # 绘制边界框
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, f"{cls_name} {sim:.2f}",
-                            (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                
+                # 绘制标签（包含来源标记）
+                if source == "phone_detect":
+                    label = f"{cls_name} {sim:.2f} [📱]"
+                elif source == "model_fallback":
+                    label = f"{cls_name} {sim:.2f} [fallback]"
+                else:
+                    label = f"{cls_name} {sim:.2f}"
+                
+                (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                cv2.rectangle(frame, (x1, y1 - text_h - 8), (x1 + text_w, y1), color, -1)
+                cv2.putText(frame, label, (x1, y1 - 5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        
     except Exception as e:
         logger.error(f"检测异常: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
     
     return frame, current_abnormal
 
@@ -285,12 +531,13 @@ class VideoThread(QThread):
     error_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int)
 
-    def __init__(self, source=0, save_path=None, conf_thres=CONF_THRES, sim_thres=SIM_THRES):
+    def __init__(self, source=0, save_path=None, conf_thres=CONF_THRES, sim_thres=SIM_THRES, iou_thres=0.50):
         super().__init__()
         self.source = source
         self.save_path = save_path
         self.conf_thres = conf_thres
         self.sim_thres = sim_thres
+        self.iou_thres = iou_thres
         self.running = True
         self.writer = None
         self.cap = None
@@ -316,7 +563,7 @@ class VideoThread(QThread):
                 ret, frame = self.cap.read()
                 if not ret:
                     break
-                frame, ab = detect_and_draw(frame, self.conf_thres, self.sim_thres)
+                frame, ab = detect_and_draw(frame, self.conf_thres, self.sim_thres, self.iou_thres)
                 if self.writer:
                     self.writer.write(frame)
                 self.frame_signal.emit(frame, ab)
@@ -351,9 +598,8 @@ class ConfigDialog(QDialog):
         
         form_layout = QFormLayout()
         
-        # YOLO置信度阈值
         self.yolo_conf_slider = QSlider(Qt.Horizontal)
-        self.yolo_conf_slider.setRange(10, 90)  # 0.1-0.9
+        self.yolo_conf_slider.setRange(10, 90)
         self.yolo_conf_slider.setValue(int(self.conf_thres * 100))
         self.yolo_conf_label = QLabel(f"{self.conf_thres:.2f}")
         self.yolo_conf_slider.valueChanged.connect(
@@ -361,9 +607,8 @@ class ConfigDialog(QDialog):
         form_layout.addRow("YOLO置信度阈值:", self.yolo_conf_slider)
         form_layout.addRow("当前值:", self.yolo_conf_label)
         
-        # CLIP相似度阈值
         self.clip_sim_slider = QSlider(Qt.Horizontal)
-        self.clip_sim_slider.setRange(10, 90)  # 0.1-0.9
+        self.clip_sim_slider.setRange(10, 90)
         self.clip_sim_slider.setValue(int(self.sim_thres * 100))
         self.clip_sim_label = QLabel(f"{self.sim_thres:.2f}")
         self.clip_sim_slider.valueChanged.connect(
@@ -371,7 +616,6 @@ class ConfigDialog(QDialog):
         form_layout.addRow("CLIP相似度阈值:", self.clip_sim_slider)
         form_layout.addRow("当前值:", self.clip_sim_label)
         
-        # 冷却时间
         self.cooldown_spin = QDoubleSpinBox()
         self.cooldown_spin.setRange(0.5, 10.0)
         self.cooldown_spin.setSingleStep(0.5)
@@ -381,7 +625,6 @@ class ConfigDialog(QDialog):
         
         layout.addLayout(form_layout)
         
-        # 按钮
         btn_layout = QHBoxLayout()
         self.btn_apply = QPushButton("应用")
         self.btn_apply.clicked.connect(self.accept)
@@ -403,38 +646,33 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         
-        # 检查必要文件
         success, msg = check_required_files()
         if not success:
             QMessageBox.critical(None, "文件缺失错误", msg)
             sys.exit(1)
         
-        # 初始化参数
         self.conf_thres = CONF_THRES
         self.sim_thres = SIM_THRES
         self.cooldown = STAT_COOLDOWN
         
-        # 统计管理器
         self.stat_manager = StatisticsManager(CLASS_NAMES)
-        
-        # 性能监控
         self.performance_monitor = PerformanceMonitor()
         
-        # 界面初始化
+        # 加载 Prototypical Networks
+        load_protonet_model()
+        
         self.init_window()
         self.initUI()
         self.load_history()
         
     def init_window(self):
-        """初始化窗口"""
         width = config_manager.get("ui.window_width", 1300)
         height = config_manager.get("ui.window_height", 850)
         self.setWindowTitle("儿童课堂异常行为检测与干预系统")
         self.setGeometry(100, 100, width, height)
         
     def initUI(self):
-        """初始化现代化界面 - 保留所有原有功能"""
-        # 设置全局样式
+        """初始化现代化界面"""
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #f0f4f8;
@@ -448,14 +686,13 @@ class MainWindow(QMainWindow):
             }
         """)
         
-        # 主窗口
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QHBoxLayout(main_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
         
-        # ========== 左侧导航栏（20%） ==========
+        # ========== 左侧导航栏 ==========
         left_panel = QWidget()
         left_panel.setObjectName("left_panel")
         left_panel.setStyleSheet("""
@@ -469,18 +706,24 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(20, 20, 20, 20)
         left_layout.setSpacing(12)
         
-        # 标题
-        nav_title = QLabel("🎓 儿童课堂异常行为检测与干预系统")
+        nav_title = QLabel("🎓 儿童课堂异常行为检测")
         nav_title.setStyleSheet("""
-            font-size: 18px;
+            font-size: 16px;
             font-weight: bold;
             color: #2c3e50;
             padding-bottom: 15px;
             border-bottom: 3px solid #5bc0de;
+            line-height: 1.4;
         """)
+        nav_title.setWordWrap(True)
         left_layout.addWidget(nav_title)
         
-        # 导航按钮 - 保留所有原有功能
+        # 显示当前使用的模型
+        model_label = QLabel("🤖 使用模型: " + ("Prototypical Networks" if USE_PROTONET else "CLIP"))
+        model_label.setStyleSheet("font-size: 11px; color: #5bc0de; margin-bottom: 10px;")
+        model_label.setWordWrap(True)
+        left_layout.addWidget(model_label)
+        
         nav_buttons = [
             ("📷 摄像头", self.open_cam),
             ("🖼️ 图片检测", self.open_img),
@@ -520,8 +763,7 @@ class MainWindow(QMainWindow):
         
         left_layout.addStretch()
         
-        # 版本信息
-        version_label = QLabel("v1.1.0 | 儿童课堂异常行为检测与干预系统")
+        version_label = QLabel("v1.2.0 | Prototypical Networks\\n少样本学习")
         version_label.setStyleSheet("color: #a0aec0; font-size: 11px;")
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setWordWrap(True)
@@ -529,14 +771,14 @@ class MainWindow(QMainWindow):
         
         main_layout.addWidget(left_panel, stretch=2)
         
-        # ========== 中间主区域（55%） ==========
+        # ========== 中间主区域 ==========
         center_panel = QWidget()
         center_panel.setStyleSheet("background-color: #f8fafc;")
         center_layout = QVBoxLayout(center_panel)
         center_layout.setContentsMargins(20, 20, 20, 20)
         center_layout.setSpacing(15)
         
-        # 顶部控制栏 - 包含原有参数
+        # 顶部控制栏
         control_bar = QWidget()
         control_bar.setStyleSheet("""
             background-color: #ffffff;
@@ -546,7 +788,6 @@ class MainWindow(QMainWindow):
         control_layout = QHBoxLayout(control_bar)
         control_layout.setContentsMargins(15, 15, 15, 15)
         
-        # 置信度滑块（原有功能）
         conf_layout = QHBoxLayout()
         conf_label = QLabel("置信度 (Conf):")
         conf_label.setStyleSheet("font-size: 13px; color: #4a5568; font-weight: 500;")
@@ -580,7 +821,6 @@ class MainWindow(QMainWindow):
         conf_layout.addWidget(self.conf_value)
         control_layout.addLayout(conf_layout, stretch=2)
         
-        # 交并比滑块（新增但有用）
         iou_layout = QHBoxLayout()
         iou_label = QLabel("交并比 (IoU):")
         iou_label.setStyleSheet("font-size: 13px; color: #4a5568; font-weight: 500;")
@@ -597,7 +837,6 @@ class MainWindow(QMainWindow):
         iou_layout.addWidget(self.iou_value)
         control_layout.addLayout(iou_layout, stretch=2)
         
-        # 检测信息卡片
         info_card = QWidget()
         info_card.setStyleSheet("""
             background-color: #f7fafc;
@@ -621,7 +860,7 @@ class MainWindow(QMainWindow):
         
         center_layout.addWidget(control_bar)
         
-        # 视频显示区域（原有）
+        # 视频显示区域
         video_container = QWidget()
         video_container.setStyleSheet("""
             background-color: #ffffff;
@@ -647,7 +886,7 @@ class MainWindow(QMainWindow):
         
         center_layout.addWidget(video_container, stretch=1)
         
-        # 进度条（原有）
+        # 进度条
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.progress_bar.setStyleSheet("""
@@ -664,10 +903,10 @@ class MainWindow(QMainWindow):
         """)
         center_layout.addWidget(self.progress_bar)
         
-        # 统计信息标签（原有，移到中间底部）
+        # 统计信息
         self.stat_label = QLabel("📊 异常行为统计：暂无数据")
-        self.stat_label.setTextFormat(Qt.RichText)  
-        self.stat_label.setWordWrap(True)  # 自动换行
+        self.stat_label.setTextFormat(Qt.RichText)
+        self.stat_label.setWordWrap(True)
         self.stat_label.setStyleSheet("""
             background-color: #ffffff;
             border-radius: 8px;
@@ -681,7 +920,7 @@ class MainWindow(QMainWindow):
         
         main_layout.addWidget(center_panel, stretch=5)
         
-        # ========== 右侧面板（25%） ==========
+        # ========== 右侧面板 ==========
         right_panel = QWidget()
         right_panel.setStyleSheet("background-color: #ffffff; border-left: 1px solid #e0e6ed;")
         right_panel.setMaximumWidth(350)
@@ -727,7 +966,7 @@ class MainWindow(QMainWindow):
 
         self.advice_text = QTextEdit()
         self.advice_text.setReadOnly(True)
-        self.advice_text.setMinimumHeight(180)  # 设置最小高度
+        self.advice_text.setMinimumHeight(180)
         self.advice_text.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.advice_text.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.advice_text.setStyleSheet("""
@@ -754,15 +993,14 @@ class MainWindow(QMainWindow):
             }
         """)
         self.advice_text.setPlaceholderText("暂无异常行为...")
-        advice_layout.addWidget(self.advice_text, stretch=1)  # 添加 stretch 让它占据更多空间
+        advice_layout.addWidget(self.advice_text, stretch=1)
 
-        # 当前异常列表
         abnormal_title = QLabel("⚠️ 当前检测到的异常")
         abnormal_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #9c4221; margin-top: 5px;")
         advice_layout.addWidget(abnormal_title)
 
         self.current_abnormal_list = QListWidget()
-        self.current_abnormal_list.setMinimumHeight(120)  # 设置最小高度
+        self.current_abnormal_list.setMinimumHeight(120)
         self.current_abnormal_list.setStyleSheet("""
             QListWidget {
                 background-color: #ffffff;
@@ -783,9 +1021,9 @@ class MainWindow(QMainWindow):
         """)
         advice_layout.addWidget(self.current_abnormal_list, stretch=1)
 
-        right_layout.addWidget(advice_panel, stretch=3)  # 增加 stretch 权重
+        right_layout.addWidget(advice_panel, stretch=3)
         
-        # FPS显示（原有）
+        # FPS显示
         self.fps_label = QLabel("FPS: --")
         self.fps_label.setStyleSheet("color: #a0aec0; font-size: 12px;")
         self.fps_label.setAlignment(Qt.AlignRight)
@@ -795,7 +1033,7 @@ class MainWindow(QMainWindow):
         
         main_layout.addWidget(right_panel, stretch=3)
         
-        # ========== 初始化所有原有变量 ==========
+        # 初始化变量
         self.thread = None
         self.current_frame = None
         self.current_session = None
@@ -805,9 +1043,8 @@ class MainWindow(QMainWindow):
         self.current_frame_abnormal = set()
         self.detection_time = 0
         
-        # 加载历史记录（原有功能）
         self.load_history()
-        
+
     def load_history(self):
         """加载历史记录"""
         if os.path.exists("session_history.json"):
@@ -819,15 +1056,12 @@ class MainWindow(QMainWindow):
                 
     def start_new_session(self, session_type, source_info=""):
         """开始新会话"""
-        # 保存当前会话
         if self.current_session and not self.session_saved:
             self.save_current_session()
         
-        # 重置会话相关状态
         self.shown_behaviors = set()
         self.stat_manager.reset_session()
         
-        # 创建新会话
         self.current_session = {
             "type": session_type,
             "source": source_info,
@@ -871,7 +1105,6 @@ class MainWindow(QMainWindow):
         self.current_frame = frame.copy()
         self.current_frame_abnormal = ab_set
         
-        # 更新状态标签
         if ab_set and ab_set != {"normal"}:
             self.status.setText("🔴 检测中 - 发现异常")
             self.status.setStyleSheet("font-size: 12px; color: #fc8181; font-weight: bold;")
@@ -879,10 +1112,8 @@ class MainWindow(QMainWindow):
             self.status.setText("🟢 检测中 - 正常")
             self.status.setStyleSheet("font-size: 12px; color: #48bb78; font-weight: bold;")
         
-        # 更新目标数
         self.target_label.setText(f"🎯 检测目标: {len(ab_set)}个")
         
-        # 原有显示代码...
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bpl = ch * w
@@ -890,10 +1121,8 @@ class MainWindow(QMainWindow):
         self.label.setPixmap(QPixmap.fromImage(q_img).scaled(
             self.label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
-        # 更新干预建议面板
         self.update_advice_panel(ab_set)
         
-        # 更新统计（原有代码）
         new_abnormal = False
         for ab in ab_set:
             if self.stat_manager.update(ab, self.cooldown):
@@ -902,13 +1131,11 @@ class MainWindow(QMainWindow):
                     self.shown_behaviors.add(ab)
                     self.log_behavior(ab)
         
-        # 显示合并弹窗（原有代码）
         if new_abnormal and ab_set:
             self.show_merged_intervention_dialog(ab_set)
         
         self.update_stat()
         
-        # 更新性能监控
         end_time = time.time()
         process_time = (end_time - start_time) * 1000
         self.performance_monitor.add_frame_time(process_time)
@@ -916,14 +1143,11 @@ class MainWindow(QMainWindow):
         self.fps_label.setText(f"FPS: {stats['current_fps']:.1f}")
         self.time_label.setText(f"⏱️ 检测耗时: {process_time/1000:.2f}s")
 
-
     def update_advice_panel(self, ab_set):
         """更新右侧干预建议面板"""
-        # 清空当前异常列表
         self.current_abnormal_list.clear()
         
         if not ab_set or ab_set == {"normal"}:
-            # 无异常
             self.advice_text.setHtml("""
                 <div style="color: #5cb85c; text-align: center; padding: 20px;">
                     <h3>✅ 课堂秩序良好</h3>
@@ -935,19 +1159,16 @@ class MainWindow(QMainWindow):
             self.current_abnormal_list.item(0).setForeground(QColor("#5cb85c"))
             return
         
-        # 构建干预建议文本
-        advice_html = "<div style=\"padding: 10px;\">"
-        advice_html += "<h3 style=\"color: #d9534f; margin-bottom: 15px;\">⚠️ 检测到异常行为</h3>"
+        advice_html = '<div style="padding: 10px;">'
+        advice_html += '<h3 style="color: #d9534f; margin-bottom: 15px;">⚠️ 检测到异常行为</h3>'
         
         for ab in sorted(ab_set):
             if ab == "normal":
                 continue
                 
-            # 添加到列表
             item_text = f"{ab} ({datetime.now().strftime('%H:%M:%S')})"
             self.current_abnormal_list.addItem(item_text)
             
-            # 添加干预建议到文本区域
             advice = INTERVENTION_MAP.get(ab, f"【注意】检测到 {ab} 行为")
             advice_html += f"""
                 <div style="background-color: #f8d7da; border-left: 4px solid #d9534f; 
@@ -960,47 +1181,34 @@ class MainWindow(QMainWindow):
         advice_html += "</div>"
         self.advice_text.setHtml(advice_html)
 
-
     def show_merged_intervention_dialog(self, ab_set):
-        """显示合并的干预建议弹窗 - 修复布局"""
+        """显示合并的干预建议弹窗"""
         if not ab_set or ab_set == {"normal"}:
             return
         
-        # 构建合并的弹窗内容
         title = f"干预建议 - 检测到 {len([ab for ab in ab_set if ab != 'normal'])} 项异常"
         
-        # 创建自定义对话框而不是 QMessageBox
         dialog = QDialog(self)
         dialog.setWindowTitle(title)
         dialog.setMinimumWidth(450)
         dialog.setMaximumWidth(500)
         
-        # 主布局
         layout = QVBoxLayout(dialog)
         layout.setSpacing(15)
         layout.setContentsMargins(20, 20, 20, 20)
         
-        # 标题区域（带图标）
         title_layout = QHBoxLayout()
-        
-        # 警告图标
         warning_icon = QLabel("⚠️")
         warning_icon.setStyleSheet("font-size: 24px;")
         title_layout.addWidget(warning_icon)
         
-        # 标题文字
         title_label = QLabel("检测到以下异常行为：")
-        title_label.setStyleSheet("""
-            font-size: 14px;
-            font-weight: bold;
-            color: #333;
-        """)
+        title_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #333;")
         title_layout.addWidget(title_label)
         title_layout.addStretch()
         
         layout.addLayout(title_layout)
         
-        # 异常行为列表区域
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setMaximumHeight(300)
@@ -1018,7 +1226,6 @@ class MainWindow(QMainWindow):
             advice = INTERVENTION_MAP.get(ab, f"检测到 {ab}")
             short_advice = advice.replace("【干预建议】", "").replace("【注意】", "")
             
-            # 每个异常行为的卡片
             card = QWidget()
             card.setStyleSheet("""
                 QWidget {
@@ -1031,12 +1238,10 @@ class MainWindow(QMainWindow):
             card_layout.setContentsMargins(12, 10, 12, 10)
             card_layout.setSpacing(5)
             
-            # 行为类型标签
             behavior_label = QLabel(f"<b>{ab}</b>")
             behavior_label.setStyleSheet("color: #721c24; font-size: 13px;")
             card_layout.addWidget(behavior_label)
             
-            # 干预建议内容
             advice_label = QLabel(short_advice)
             advice_label.setStyleSheet("color: #856404; font-size: 12px;")
             advice_label.setWordWrap(True)
@@ -1048,17 +1253,11 @@ class MainWindow(QMainWindow):
         scroll_area.setWidget(content_widget)
         layout.addWidget(scroll_area)
         
-        # 底部提示
         hint_label = QLabel("请及时关注并处理上述情况")
-        hint_label.setStyleSheet("""
-            color: #666;
-            font-size: 12px;
-            margin-top: 10px;
-        """)
+        hint_label.setStyleSheet("color: #666; font-size: 12px; margin-top: 10px;")
         hint_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(hint_label)
         
-        # 确定按钮
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         
@@ -1086,13 +1285,7 @@ class MainWindow(QMainWindow):
         
         layout.addLayout(btn_layout)
         
-        # 设置对话框样式
-        dialog.setStyleSheet("""
-            QDialog {
-                background-color: #ffffff;
-            }
-        """)
-        
+        dialog.setStyleSheet("QDialog { background-color: #ffffff; }")
         dialog.exec_()
         
     def update_stat(self):
@@ -1100,7 +1293,6 @@ class MainWindow(QMainWindow):
         session_summary = self.stat_manager.get_session_summary()
         global_summary = self.stat_manager.get_global_summary()
         
-        # 使用 HTML 格式显示
         html_text = f"""
         <div style="line-height: 1.6; font-size: 13px;">
             <b>📊 统计概览</b><br/>
@@ -1112,7 +1304,7 @@ class MainWindow(QMainWindow):
             html_text += "<br/><br/><b>🔍 当前会话异常分布:</b>"
             for behavior, count in session_summary['by_behavior'].items():
                 percentage = (count / session_summary['total'] * 100) if session_summary['total'] > 0 else 0
-                bar = "█" * int(percentage / 10)  # 进度条
+                bar = "█" * int(percentage / 10)
                 html_text += f"""
                 <div style="margin: 5px 0;">
                     {behavior}: <span style="color: #d9534f; font-weight: bold;">{count}次</span> 
@@ -1142,7 +1334,6 @@ class MainWindow(QMainWindow):
         """打开摄像头"""
         self.stop_all()
         
-        # 检测摄像头
         cap_test = cv2.VideoCapture(0)
         if not cap_test.isOpened():
             QMessageBox.warning(self, "摄像头错误", "无法打开摄像头，请检查设备连接")
@@ -1150,8 +1341,10 @@ class MainWindow(QMainWindow):
             return
         cap_test.release()
         
+        iou = self.iou_slider.value() / 100
+        
         self.start_new_session("camera", "摄像头实时检测")
-        self.thread = VideoThread(0, conf_thres=self.conf_thres, sim_thres=self.sim_thres)
+        self.thread = VideoThread(0, conf_thres=self.conf_thres, sim_thres=self.sim_thres, iou_thres=iou)
         self.thread.frame_signal.connect(self.show_frame)
         self.thread.error_signal.connect(lambda m: self.status.setText(f"错误: {m}"))
         self.thread.start()
@@ -1179,9 +1372,11 @@ class MainWindow(QMainWindow):
             if frame.size == 0:
                 QMessageBox.warning(self, "图片错误", "图片为空或损坏")
                 return
+            
+            iou = self.iou_slider.value() / 100
                 
             self.start_new_session("image", os.path.basename(path))
-            frame, ab = detect_and_draw(frame, self.conf_thres, self.sim_thres)
+            frame, ab = detect_and_draw(frame, self.conf_thres, self.sim_thres, iou)
             self.show_frame(frame, ab)
             self.status.setText(f"图片检测完成: {os.path.basename(path)}")
             
@@ -1209,8 +1404,10 @@ class MainWindow(QMainWindow):
         if not save_path.endswith(".mp4"):
             save_path += ".mp4"
         
+        iou = self.iou_slider.value() / 100
+        
         self.start_new_session("video", f"{os.path.basename(src)} -> {os.path.basename(save_path)}")
-        self.thread = VideoThread(src, save_path, self.conf_thres, self.sim_thres)
+        self.thread = VideoThread(src, save_path, self.conf_thres, self.sim_thres, iou)
         self.thread.frame_signal.connect(self.show_frame)
         self.thread.progress_signal.connect(self.progress_bar.setValue)
         self.thread.error_signal.connect(lambda m: self.status.setText(f"错误: {m}"))
@@ -1237,7 +1434,7 @@ class MainWindow(QMainWindow):
     def reset_stats(self):
         """重置统计"""
         reply = QMessageBox.question(self, "确认重置", 
-                                    "确定要重置所有统计吗？\n（包括当前会话和全局统计）",
+                                    "确定要重置所有统计吗？\\n（包括当前会话和全局统计）",
                                     QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             self.stat_manager.reset_all()
@@ -1255,10 +1452,8 @@ class MainWindow(QMainWindow):
         
         layout = QVBoxLayout(dialog)
         
-        # 创建标签页
         tab_widget = QTabWidget()
         
-        # 会话统计标签页
         session_tab = QWidget()
         session_layout = QVBoxLayout(session_tab)
         
@@ -1266,26 +1461,25 @@ class MainWindow(QMainWindow):
         session_text.setReadOnly(True)
         
         session_summary = self.stat_manager.get_session_summary()
-        text = "=" * 40 + "\n"
-        text += "当前会话统计\n"
-        text += "=" * 40 + "\n"
-        text += f"开始时间: {self.current_session['start_time'] if self.current_session else '无会话'}\n"
-        text += f"异常总数: {session_summary['total']}\n"
-        text += f"检测参数: YOLO置信度={self.conf_thres:.2f}, CLIP相似度={self.sim_thres:.2f}\n"
-        text += "-" * 40 + "\n"
+        text = "=" * 40 + "\\n"
+        text += "当前会话统计\\n"
+        text += "=" * 40 + "\\n"
+        text += f"开始时间: {self.current_session['start_time'] if self.current_session else '无会话'}\\n"
+        text += f"异常总数: {session_summary['total']}\\n"
+        text += f"检测参数: YOLO置信度={self.conf_thres:.2f}, CLIP相似度={self.sim_thres:.2f}\\n"
+        text += "-" * 40 + "\\n"
         
         if session_summary['by_behavior']:
-            text += "按行为分类:\n"
+            text += "按行为分类:\\n"
             for behavior, count in session_summary['by_behavior'].items():
                 percentage = (count / session_summary['total'] * 100) if session_summary['total'] > 0 else 0
-                text += f"  {behavior}: {count} 次 ({percentage:.1f}%)\n"
+                text += f"  {behavior}: {count} 次 ({percentage:.1f}%)\\n"
         else:
-            text += "暂无异常行为记录\n"
+            text += "暂无异常行为记录\\n"
         
         session_text.setText(text)
         session_layout.addWidget(session_text)
         
-        # 全局统计标签页
         global_tab = QWidget()
         global_layout = QVBoxLayout(global_tab)
         
@@ -1293,31 +1487,29 @@ class MainWindow(QMainWindow):
         global_text.setReadOnly(True)
         
         global_summary = self.stat_manager.get_global_summary()
-        text = "=" * 40 + "\n"
-        text += "全局历史统计\n"
-        text += "=" * 40 + "\n"
-        text += f"累计异常总数: {global_summary['total']}\n"
-        text += f"统计时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        text += "-" * 40 + "\n"
+        text = "=" * 40 + "\\n"
+        text += "全局历史统计\\n"
+        text += "=" * 40 + "\\n"
+        text += f"累计异常总数: {global_summary['total']}\\n"
+        text += f"统计时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\\n"
+        text += "-" * 40 + "\\n"
         
         if global_summary['by_behavior']:
-            text += "按行为分类:\n"
+            text += "按行为分类:\\n"
             for behavior, count in global_summary['by_behavior'].items():
                 percentage = (count / global_summary['total'] * 100) if global_summary['total'] > 0 else 0
-                text += f"  {behavior}: {count} 次 ({percentage:.1f}%)\n"
+                text += f"  {behavior}: {count} 次 ({percentage:.1f}%)\\n"
         else:
-            text += "暂无历史数据\n"
+            text += "暂无历史数据\\n"
         
         global_text.setText(text)
         global_layout.addWidget(global_text)
         
-        # 添加标签页
         tab_widget.addTab(session_tab, "当前会话")
         tab_widget.addTab(global_tab, "历史统计")
         
         layout.addWidget(tab_widget)
         
-        # 添加按钮
         btn_layout = QHBoxLayout()
         export_btn = QPushButton("导出为CSV")
         export_btn.clicked.connect(lambda: self.export_statistics_csv())
@@ -1395,7 +1587,6 @@ class MainWindow(QMainWindow):
             self.cooldown = values['cooldown']
             self.stat_manager.cooldown = self.cooldown
             
-            # 保存到配置
             config_manager.set("detection.conf_thres", self.conf_thres)
             config_manager.set("detection.sim_thres", self.sim_thres)
             config_manager.set("detection.cooldown", self.cooldown)
@@ -1406,11 +1597,12 @@ class MainWindow(QMainWindow):
         """显示关于对话框"""
         about_text = """
         <h3>儿童课堂异常行为检测与干预系统</h3>
-        <p><b>版本:</b> 1.1.0</p>
+        <p><b>版本:</b> 1.2.0</p>
         <p><b>技术架构:</b></p>
         <ul>
             <li>目标检测: YOLOv8</li>
-            <li>行为识别: CLIP (Vision Transformer)</li>
+            <li>行为识别: Prototypical Networks (少样本学习)</li>
+            <li>备用方案: CLIP (Vision Transformer)</li>
             <li>界面框架: PyQt5</li>
             <li>视频处理: OpenCV</li>
         </ul>
@@ -1431,6 +1623,7 @@ class MainWindow(QMainWindow):
             <li>异常行为标注与保存</li>
             <li>个性化干预建议</li>
             <li>详细统计分析</li>
+            <li>少样本学习 (Prototypical Networks)</li>
         </ul>
         <p><b>快捷键:</b></p>
         <ul>
@@ -1445,6 +1638,7 @@ class MainWindow(QMainWindow):
         <p>1. 使用前请运行 build_prototype.py 生成原型文件</p>
         <p>2. 首次使用会自动下载YOLOv8模型</p>
         <p>3. 建议在GPU环境下运行以获得最佳性能</p>
+        <p>4. 如需使用 Prototypical Networks，请先运行 train_protonet.py 训练模型</p>
         <p><i>© 2026 儿童课堂异常行为检测与干预系统</i></p>
         """
         
@@ -1473,20 +1667,15 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """关闭事件"""
         self.stop_all()
-        
-        # 保存窗口尺寸
         config_manager.set("ui.window_width", self.width())
         config_manager.set("ui.window_height", self.height())
-        
         event.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     
-    # 设置应用样式
     app.setStyle("Fusion")
     
-    # 设置调色板
     palette = QPalette()
     palette.setColor(QPalette.Window, QColor(240, 240, 240))
     palette.setColor(QPalette.WindowText, QColor(0, 0, 0))
@@ -1502,7 +1691,6 @@ if __name__ == "__main__":
     palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
     app.setPalette(palette)
     
-    # 设置字体
     font = QFont("Microsoft YaHei", 10)
     app.setFont(font)
     
