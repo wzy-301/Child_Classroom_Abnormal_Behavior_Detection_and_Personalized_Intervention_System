@@ -345,7 +345,7 @@ def main():
     # 创建 episode 采样器
     # n_way: 每轮选几个类别（建议等于总类别数或稍小）
     # k_shot: 每类几张 support（你的数据量决定）
-    n_way = min(num_classes, 5)  # 如果类别少，就用全部
+    n_way = num_classes  # 如果类别少，就用全部
     k_shot = 5  # 每类取 5 张作为 support
     
     print(f"\\n[2/4] 创建 Episode 采样器 (n_way={n_way}, k_shot={k_shot})...")
