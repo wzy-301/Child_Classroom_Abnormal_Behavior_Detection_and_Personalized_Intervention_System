@@ -28,6 +28,18 @@ from config_manager import ConfigManager
 config_manager = ConfigManager()
 
 # 从配置中读取参数
+PROTONET_FIX = config_manager.get("detection.protonet_fix", {
+    "phone_discount": 0.5,
+    "normal_min_for_fix2": 0.5,
+    "fix2_gap_threshold": 0.1,
+    "fix3_gap_threshold": 0.1,
+    "fallback_gap": 0.15,
+    "phone_iou_threshold": 0.3,
+    "phone_dist_multiplier": 1.2,
+    "phone_y_min_ratio": 0.1,
+    "phone_y_max_ratio": 0.9
+})
+
 CONF_THRES = config_manager.get("detection.conf_thres", 0.35)
 SIM_THRES = config_manager.get("detection.sim_thres", 0.25)
 STAT_COOLDOWN = config_manager.get("detection.cooldown", 3.0)
@@ -106,7 +118,7 @@ def load_protonet_model():
 # 干预建议映射
 INTERVENTION_MAP = {
     "lie": "【干预建议】学生趴桌，提醒端正坐姿，保持专注",
-    "stand": "【注意】检测到学生站立，请确认：\\n1. 是否经允许回答问题\\n2. 是否擅自离座\\n3. 是否小组活动需要",
+    "stand": "【注意】检测到学生站立，请确认：\n1. 是否经允许回答问题\n2. 是否擅自离座\n3. 是否小组活动需要",
     "play_phone": "【干预建议】发现使用手机，提醒收起电子设备",
     "fight": "【干预建议】发现打闹行为，立即制止，维持课堂安全",
     "whispering": "【干预建议】检测到交头接耳，请提醒保持安静，专注听讲",
@@ -115,15 +127,15 @@ INTERVENTION_MAP = {
 }
 
 # 类别特定阈值
-CLASS_THRESHOLDS = {
-    "lie": 0.20,
-    "stand": 0.30,
-    "play_phone": 0.25,
-    "fight": 0.20,
-    "whispering": 0.28,
-    "looking_around": 0.30,
-    "normal": 0.15,
-}
+CLASS_THRESHOLDS = config_manager.get("detection.class_thresholds", {
+    "lie": 0.35,
+    "stand": 0.40,
+    "play_phone": 0.45,
+    "fight": 0.35,
+    "whispering": 0.38,
+    "looking_around": 0.38,
+    "normal": 0.25
+})
 
 class StatisticsManager:
     """专门管理统计数据的类"""
@@ -226,8 +238,8 @@ def check_required_files():
             missing_files.append(file_path)
     
     if missing_files:
-        error_msg = f"缺少必要文件：{', '.join(missing_files)}\\n"
-        error_msg += "请确保：\\n1. 已运行 build_prototype.py 生成 prototypes.pkl\\n"
+        error_msg = f"缺少必要文件：{', '.join(missing_files)}\n"
+        error_msg += "请确保：\n1. 已运行 build_prototype.py 生成 prototypes.pkl\n"
         error_msg += "2. 已下载 yolov8s.pt 模型文件到当前目录"
         return False, error_msg
     
@@ -292,7 +304,7 @@ def classify_crop(frame, box, use_class_specific=True):
         return "normal", 0
 
 def classify_crop_protonet(frame, box):
-    """终极修复版 - 彻底解决 play_phone 误判"""
+    """Prototypical Networks 分类 - 使用配置文件参数"""
     try:
         if PROTOTYPICAL_MODEL is None or PROTOTYPES_PROTO is None:
             cls, sim = classify_crop(frame, box)
@@ -324,30 +336,32 @@ def classify_crop_protonet(frame, box):
             sim = np.exp(-dist**2 / (2 * 0.5**2))
             similarities[cls_name] = sim
         
-        # ========== 核心修复逻辑 ==========
+        # ========== 核心修复逻辑（使用配置参数）==========
         normal_sim = similarities.get("normal", 0)
-        # phone_sim = similarities.get("play_phone", 0)
         
-        # 修复1: 对 play_phone 打5折（因为没有手机验证）
+        # 修复1: 对 play_phone 打折（从配置读取）
+        discount = PROTONET_FIX.get("phone_discount", 0.5)
         if "play_phone" in similarities:
-            similarities["play_phone"] *= 0.5
-            # phone_sim = similarities["play_phone"]
+            similarities["play_phone"] *= discount
         
-        # 修复2: 如果 normal >= 0.2，且最高异常类只比 normal 高一点点（<0.12），选 normal
-        if normal_sim >= 0.2:
+        # 修复2: 从配置读取阈值
+        normal_min = PROTONET_FIX.get("normal_min_for_fix2", 0.5)
+        fix2_gap = PROTONET_FIX.get("fix2_gap_threshold", 0.1)
+        
+        if normal_sim >= normal_min:
             best_abnormal_sim = 0
             for cls in ["lie", "stand", "play_phone", "fight", "whispering", "looking_around"]:
                 if similarities.get(cls, 0) > best_abnormal_sim:
                     best_abnormal_sim = similarities[cls]
             
-            if best_abnormal_sim - normal_sim < 0.12:
+            if best_abnormal_sim - normal_sim < fix2_gap:
                 return "normal", normal_sim, similarities
         
-        # 修复3: play_phone 打折后仍然是所有类别中最高的
+        # 修复3: 从配置读取阈值
+        fix3_gap = PROTONET_FIX.get("fix3_gap_threshold", 0.1)
         current_best = max(similarities, key=similarities.get)
         
         if current_best == "play_phone":
-            # 找到第二高的类别（排除 play_phone）
             second_best = None
             second_sim = 0
             for c, s in similarities.items():
@@ -355,28 +369,18 @@ def classify_crop_protonet(frame, box):
                     second_sim = s
                     second_best = c
             
-            # 如果第二高只比 normal 高一点点（<0.1），说明整体不确定，选 normal
-            if second_best and (second_sim - normal_sim < 0.1):
+            if second_best and (second_sim - normal_sim < fix3_gap):
                 return "normal", normal_sim, similarities
-            
-            # 否则，第二高可能是其他真实异常（lie/stand等），选第二高
             elif second_best:
                 return second_best, second_sim, similarities
-            
-            # 如果没有第二高（理论上不会发生），选 normal
             else:
                 return "normal", normal_sim, similarities
         
-        # 找最大值（此时 play_phone 已经被处理过）
+        # 阈值判断（从配置读取）
         pred = max(similarities, key=similarities.get)
         max_sim = similarities[pred]
         
-        # 阈值判断
-        thresholds = {
-            "normal": 0.25, "lie": 0.35, "stand": 0.40,
-            "play_phone": 0.45, "fight": 0.35,
-            "whispering": 0.38, "looking_around": 0.38
-        }
+        thresholds = CLASS_THRESHOLDS  # 从配置读取
         
         if max_sim < thresholds.get(pred, 0.35):
             pred = "normal"
@@ -388,26 +392,14 @@ def classify_crop_protonet(frame, box):
         cls, sim = classify_crop(frame, box)
         return cls, sim, None
 
+
 def detect_and_draw(frame, conf_thres=CONF_THRES, sim_thres=SIM_THRES, iou_thres=0.50, use_class_specific=True):
-    """检测并绘制结果 - 结合手机目标检测 + Prototypical Networks（最终修复版）"""
+    """检测并绘制结果 - 使用配置文件参数"""
     current_abnormal = set()
     
     try:
-        # ========== 步骤1: 检测所有人 ==========
         person_results = yolo(frame, classes=[0], conf=conf_thres, iou=iou_thres, verbose=False)
-
-        # ===== 添加调试打印 =====
-        phone_results = yolo(frame, classes=[67], conf=0.25, verbose=False)
-        phone_count = sum(len(r.boxes) for r in phone_results)
-        # print(f"【调试】检测到手机数量: {phone_count}")  # 看这个数字是不是一直是0
         
-        phone_boxes = []
-        for r in phone_results:
-            for box in r.boxes.xyxy:
-                phone_boxes.append(box.cpu().numpy())
-        # =======================
-        
-        # ========== 步骤2: 检测手机/电子设备 ==========
         phone_boxes = []
         try:
             phone_results = yolo(frame, classes=[67], conf=0.25, verbose=False)
@@ -417,7 +409,12 @@ def detect_and_draw(frame, conf_thres=CONF_THRES, sim_thres=SIM_THRES, iou_thres
         except Exception as e:
             logger.debug(f"手机检测跳过: {e}")
         
-        # ========== 步骤3: 对每个人进行分类 ==========
+        # 从配置读取手机匹配参数
+        phone_iou = PROTONET_FIX.get("phone_iou_threshold", 0.3)
+        phone_dist_mult = PROTONET_FIX.get("phone_dist_multiplier", 1.2)
+        phone_y_min = PROTONET_FIX.get("phone_y_min_ratio", 0.1)
+        phone_y_max = PROTONET_FIX.get("phone_y_max_ratio", 0.9)
+        
         for r in person_results:
             for box in r.boxes.xyxy:
                 x1, y1, x2, y2 = map(int, box)
@@ -428,50 +425,61 @@ def detect_and_draw(frame, conf_thres=CONF_THRES, sim_thres=SIM_THRES, iou_thres
                 if x2 <= x1 or y2 <= y1:
                     continue
                 
-                # 计算人体信息
-                person_cx = (x1 + x2) / 2
-                person_cy = (y1 + y2) / 2
                 person_height = y2 - y1
                 
-                # ========== 步骤4: 检查此人附近是否有手机 ==========
+                # 检查手机（使用配置参数）
                 has_phone_nearby = False
                 nearest_phone_dist = float('inf')
                 
                 for pb in phone_boxes:
                     px1, py1, px2, py2 = pb
-                    phone_cx = (px1 + px2) / 2
-                    phone_cy = (py1 + py2) / 2
-                    dist = ((person_cx - phone_cx) ** 2 + (person_cy - phone_cy) ** 2) ** 0.5
                     
-                    if dist < person_height * 0.7:
-                        if py1 > y1 + person_height * 0.2 and py2 < y1 + person_height * 0.85:
+                    # IoU 重叠判断
+                    ix1 = max(x1, px1)
+                    iy1 = max(y1, py1)
+                    ix2 = min(x2, px2)
+                    iy2 = min(y2, py2)
+                    
+                    if ix2 > ix1 and iy2 > iy1:
+                        inter_area = (ix2 - ix1) * (iy2 - iy1)
+                        phone_area = (px2 - px1) * (py2 - py1)
+                        iou = inter_area / phone_area
+                        
+                        if iou > phone_iou:  # 从配置读取
                             has_phone_nearby = True
+                            phone_cy = (py1 + py2) / 2
+                            person_cy = (y1 + y2) / 2
+                            dist = abs(phone_cy - person_cy)
                             nearest_phone_dist = min(nearest_phone_dist, dist)
+                    
+                    # 距离判断（使用配置参数）
+                    else:
+                        person_cx = (x1 + x2) / 2
+                        person_cy = (y1 + y2) / 2
+                        phone_cx = (px1 + px2) / 2
+                        phone_cy = (py1 + py2) / 2
+                        dist = ((person_cx - phone_cx) ** 2 + (person_cy - phone_cy) ** 2) ** 0.5
+                        
+                        if dist < person_height * phone_dist_mult:  # 从配置读取
+                            if py2 > y1 + person_height * phone_y_min and py1 < y1 + person_height * phone_y_max:  # 从配置读取
+                                has_phone_nearby = True
+                                nearest_phone_dist = min(nearest_phone_dist, dist)
                 
-                # ========== 步骤5: 分类决策（最终修复版） ==========
-                
+                # 分类决策
                 if has_phone_nearby:
-                    # ✅ 附近检测到手机 → 直接判定为 play_phone
                     cls_name = "play_phone"
                     sim = min(0.95, 0.75 + 0.2 * (1 - nearest_phone_dist / (person_height * 0.7)))
-                    source = "phone_detect"  # 标记来源
-                    # print(f"【调试】手机检测触发! 判为 play_phone")
                     
                 else:
-                    # 附近没有手机 → 用模型判断
                     if USE_PROTONET:
                         cls_name, sim, all_sims = classify_crop_protonet(frame, [x1, y1, x2, y2])
-                        # print(f"【调试】Protonet 结果: {cls_name}, 分数: {all_sims}")
                     else:
                         cls_name, sim = classify_crop(frame, [x1, y1, x2, y2], use_class_specific)
                         all_sims = None
                     
-                    source = "model"
-                    
-                    # ✅ 关键修复：如果最高置信度是 play_phone 但没检测到手机
-                    # 选择置信度第二高的类别（排除 play_phone）
+                    # 降级逻辑（使用配置参数）
+                    fallback_gap = PROTONET_FIX.get("fallback_gap", 0.15)
                     if cls_name == "play_phone" and all_sims is not None:
-                        # 排除 play_phone，找第二高的
                         second_best = None
                         second_sim = 0
                         for c, s in all_sims.items():
@@ -479,40 +487,21 @@ def detect_and_draw(frame, conf_thres=CONF_THRES, sim_thres=SIM_THRES, iou_thres
                                 second_sim = s
                                 second_best = c
                         
-                        # 如果第二高与 play_phone 差距不大（< 0.15），选第二高
-                        if second_best and (all_sims["play_phone"] - second_sim < 0.15):
+                        if second_best and (all_sims["play_phone"] - second_sim < fallback_gap):  # 从配置读取
                             cls_name = second_best
                             sim = second_sim
-                            source = "model_fallback"  # 标记为降级选择
                 
-                # 过滤无效类别
                 if cls_name not in CLASS_NAMES:
                     continue
                 
-                # ========== 步骤6: 绘制结果 ==========
                 is_abnormal = cls_name != "normal"
                 if is_abnormal:
                     current_abnormal.add(cls_name)
                 
-                # 选择颜色
-                if cls_name == "play_phone":
-                    color = (0, 165, 255)  # 橙色
-                elif is_abnormal:
-                    color = (0, 0, 255)    # 红色
-                else:
-                    color = (0, 255, 0)    # 绿色
-                
-                # 绘制边界框
+                color = (0, 0, 255) if is_abnormal else (0, 255, 0)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 
-                # 绘制标签（包含来源标记）
-                if source == "phone_detect":
-                    label = f"{cls_name} {sim:.2f} [📱]"
-                elif source == "model_fallback":
-                    label = f"{cls_name} {sim:.2f} [fallback]"
-                else:
-                    label = f"{cls_name} {sim:.2f}"
-                
+                label = f"{cls_name} {sim:.2f}"
                 (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
                 cv2.rectangle(frame, (x1, y1 - text_h - 8), (x1 + text_w, y1), color, -1)
                 cv2.putText(frame, label, (x1, y1 - 5), 
@@ -763,7 +752,7 @@ class MainWindow(QMainWindow):
         
         left_layout.addStretch()
         
-        version_label = QLabel("v1.2.0 | Prototypical Networks\\n少样本学习")
+        version_label = QLabel("v1.3.0 | Prototypical Networks\n少样本学习")
         version_label.setStyleSheet("color: #a0aec0; font-size: 11px;")
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setWordWrap(True)
@@ -1434,7 +1423,7 @@ class MainWindow(QMainWindow):
     def reset_stats(self):
         """重置统计"""
         reply = QMessageBox.question(self, "确认重置", 
-                                    "确定要重置所有统计吗？\\n（包括当前会话和全局统计）",
+                                    "确定要重置所有统计吗？\n（包括当前会话和全局统计）",
                                     QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             self.stat_manager.reset_all()
@@ -1461,21 +1450,21 @@ class MainWindow(QMainWindow):
         session_text.setReadOnly(True)
         
         session_summary = self.stat_manager.get_session_summary()
-        text = "=" * 40 + "\\n"
-        text += "当前会话统计\\n"
-        text += "=" * 40 + "\\n"
-        text += f"开始时间: {self.current_session['start_time'] if self.current_session else '无会话'}\\n"
-        text += f"异常总数: {session_summary['total']}\\n"
-        text += f"检测参数: YOLO置信度={self.conf_thres:.2f}, CLIP相似度={self.sim_thres:.2f}\\n"
-        text += "-" * 40 + "\\n"
+        text = "=" * 40 + "\n"
+        text += "当前会话统计\n"
+        text += "=" * 40 + "\n"
+        text += f"开始时间: {self.current_session['start_time'] if self.current_session else '无会话'}\n"
+        text += f"异常总数: {session_summary['total']}\n"
+        text += f"检测参数: YOLO置信度={self.conf_thres:.2f}, CLIP相似度={self.sim_thres:.2f}\n"
+        text += "-" * 40 + "\n"
         
         if session_summary['by_behavior']:
-            text += "按行为分类:\\n"
+            text += "按行为分类:\n"
             for behavior, count in session_summary['by_behavior'].items():
                 percentage = (count / session_summary['total'] * 100) if session_summary['total'] > 0 else 0
-                text += f"  {behavior}: {count} 次 ({percentage:.1f}%)\\n"
+                text += f"  {behavior}: {count} 次 ({percentage:.1f}%)\n"
         else:
-            text += "暂无异常行为记录\\n"
+            text += "暂无异常行为记录\n"
         
         session_text.setText(text)
         session_layout.addWidget(session_text)
@@ -1487,20 +1476,20 @@ class MainWindow(QMainWindow):
         global_text.setReadOnly(True)
         
         global_summary = self.stat_manager.get_global_summary()
-        text = "=" * 40 + "\\n"
-        text += "全局历史统计\\n"
-        text += "=" * 40 + "\\n"
-        text += f"累计异常总数: {global_summary['total']}\\n"
-        text += f"统计时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\\n"
-        text += "-" * 40 + "\\n"
+        text = "=" * 40 + "\n"
+        text += "全局历史统计\n"
+        text += "=" * 40 + "\n"
+        text += f"累计异常总数: {global_summary['total']}\n"
+        text += f"统计时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        text += "-" * 40 + "\n"
         
         if global_summary['by_behavior']:
-            text += "按行为分类:\\n"
+            text += "按行为分类:\n"
             for behavior, count in global_summary['by_behavior'].items():
                 percentage = (count / global_summary['total'] * 100) if global_summary['total'] > 0 else 0
-                text += f"  {behavior}: {count} 次 ({percentage:.1f}%)\\n"
+                text += f"  {behavior}: {count} 次 ({percentage:.1f}%)\n"
         else:
-            text += "暂无历史数据\\n"
+            text += "暂无历史数据\n"
         
         global_text.setText(text)
         global_layout.addWidget(global_text)
