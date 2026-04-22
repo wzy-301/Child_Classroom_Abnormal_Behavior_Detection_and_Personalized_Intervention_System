@@ -1,16 +1,28 @@
 {
   "detection": {
     "conf_thres": 0.35,
-    "sim_thres": 0.35,
+    "sim_thres": 0.25,
     "cooldown": 4.5,
+    "iou_thres": 0.5,
     "class_thresholds": {
-      "lie": 0.15,
-      "stand": 0.3,
-      "play_phone": 0.35,
-      "fight": 0.2,
-      "whispering": 0.25,
-      "looking_around": 0.25,
-      "normal": 0.15
+      "lie": 0.35,
+      "stand": 0.4,
+      "play_phone": 0.45,
+      "fight": 0.35,
+      "whispering": 0.38,
+      "looking_around": 0.38,
+      "normal": 0.25
+    },
+    "protonet_fix": {
+      "phone_discount": 0.5,
+      "normal_min_for_fix2": 0.5,
+      "fix2_gap_threshold": 0.1,
+      "fix3_gap_threshold": 0.1,
+      "fallback_gap": 0.15,
+      "phone_iou_threshold": 0.3,
+      "phone_dist_multiplier": 1.2,
+      "phone_y_min_ratio": 0.1,
+      "phone_y_max_ratio": 0.9
     }
   },
   "ui": {
@@ -20,8 +32,6 @@
   },
   "paths": {
     "yolo_weight": "yolov8s.pt",
-    "prototype_path": "prototypes.pkl",
-    "protonet_model": "protonet_model.pth",
-    "protonet_prototypes": "protonet_prototypes.pth"
+    "prototype_path": "prototypes.pkl"
   }
 }
