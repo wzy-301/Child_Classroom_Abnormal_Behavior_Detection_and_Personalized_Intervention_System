@@ -138,7 +138,6 @@ CLASS_THRESHOLDS = config_manager.get("detection.class_thresholds", {
 })
 
 class StatisticsManager:
-    """专门管理统计数据的类"""
     def __init__(self, class_names):
         self.class_names = class_names
         self.global_stats = {c: 0 for c in class_names}
@@ -147,10 +146,10 @@ class StatisticsManager:
         self.lock = Lock()
         self.cooldown = STAT_COOLDOWN
         
-    def update(self, behavior, cooldown=None):
-        """更新统计，包含冷却时间控制"""
+    def update(self, behavior, count=1, cooldown=None):
+        """更新统计，count 为该帧中该行为的学生人数"""
         if behavior not in self.class_names or behavior == "normal":
-            return False
+            return False, 0
             
         if cooldown is None:
             cooldown = self.cooldown
@@ -158,11 +157,11 @@ class StatisticsManager:
         with self.lock:
             now = datetime.now()
             if (now - self.last_stat_time[behavior]).total_seconds() > cooldown:
-                self.global_stats[behavior] += 1
-                self.session_stats[behavior] += 1
+                self.global_stats[behavior] += count
+                self.session_stats[behavior] += count
                 self.last_stat_time[behavior] = now
-                return True
-        return False
+                return True, count
+        return False, 0
     
     def get_session_summary(self):
         """获取当前会话统计摘要"""
@@ -304,7 +303,7 @@ def classify_crop(frame, box, use_class_specific=True):
         return "normal", 0
 
 def classify_crop_protonet(frame, box):
-    """Prototypical Networks 分类 - 使用配置文件参数"""
+    """Prototypical Networks 分类"""
     try:
         if PROTOTYPICAL_MODEL is None or PROTOTYPES_PROTO is None:
             cls, sim = classify_crop(frame, box)
@@ -336,16 +335,29 @@ def classify_crop_protonet(frame, box):
             sim = np.exp(-dist**2 / (2 * 0.5**2))
             similarities[cls_name] = sim
         
-        # ========== 核心修复逻辑（使用配置参数）==========
+        # 保留原始 normal 值（后续多次使用）
         normal_sim = similarities.get("normal", 0)
         
-        # 修复1: 对 play_phone 打折（从配置读取）
+        # ========== 第1层：play_phone 打折（无手机验证时）==========
         discount = PROTONET_FIX.get("phone_discount", 0.5)
         if "play_phone" in similarities:
             similarities["play_phone"] *= discount
         
-        # 修复2: 从配置读取阈值
-        normal_min = PROTONET_FIX.get("normal_min_for_fix2", 0.5)
+        # ========== 第2层：通用模糊保护（所有异常类）==========
+        # 核心逻辑：如果最高异常类只比 normal 高一点点，说明模型不确定，优先 normal
+        # 这是课堂场景的关键保护（正常行为占绝大多数）
+        pred = max(similarities, key=similarities.get)
+        max_sim = similarities[pred]
+        
+        # 通用保守策略：最高异常类与 normal 的差距 < 0.08 且 normal 不算太低 → 优先 normal
+        if pred != "normal":
+            gap = max_sim - normal_sim
+            # 0.08 的 gap 阈值：经验值，可根据实际场景在 0.05~0.12 之间调整
+            if gap < 0.08 and normal_sim > 0.20:
+                return "normal", normal_sim, similarities
+        
+        # ========== 第3层：修复2（normal 较高时的优先保护）==========
+        normal_min = PROTONET_FIX.get("normal_min_for_fix2", 0.35)
         fix2_gap = PROTONET_FIX.get("fix2_gap_threshold", 0.1)
         
         if normal_sim >= normal_min:
@@ -354,14 +366,15 @@ def classify_crop_protonet(frame, box):
                 if similarities.get(cls, 0) > best_abnormal_sim:
                     best_abnormal_sim = similarities[cls]
             
+            # 如果最高异常类与 normal 差距很小，返回 normal
             if best_abnormal_sim - normal_sim < fix2_gap:
                 return "normal", normal_sim, similarities
         
-        # 修复3: 从配置读取阈值
+        # ========== 第4层：play_phone 专属降级（打折后仍最高）==========
         fix3_gap = PROTONET_FIX.get("fix3_gap_threshold", 0.1)
-        current_best = max(similarities, key=similarities.get)
         
-        if current_best == "play_phone":
+        if pred == "play_phone":
+            # 找第二名（不含 play_phone）
             second_best = None
             second_sim = 0
             for c, s in similarities.items():
@@ -369,56 +382,66 @@ def classify_crop_protonet(frame, box):
                     second_sim = s
                     second_best = c
             
-            if second_best and (second_sim - normal_sim < fix3_gap):
-                return "normal", normal_sim, similarities
-            elif second_best:
-                return second_best, second_sim, similarities
+            if second_best and second_sim > 0.01:  # 第二名必须有一定分数才考虑
+                # 如果第二名和 normal 很接近（差距 < 0.1），说明整体模糊，返回 normal
+                if second_sim - normal_sim < fix3_gap:
+                    return "normal", normal_sim, similarities
+                # 否则降级为第二名（如 stand、looking_around 等）
+                else:
+                    return second_best, second_sim, similarities
             else:
-                return "normal", normal_sim, similarities
+                # 只有 play_phone 有值，其他都极低 → 返回 play_phone（但仍保留 similarities 供后续 fix4 使用）
+                # return "normal", normal_sim, similarities
+                return "play_phone", similarities[pred], similarities
         
-        # 阈值判断（从配置读取）
-        pred = max(similarities, key=similarities.get)
-        max_sim = similarities[pred]
+        # ========== 第5层：最终阈值过滤 ==========
+        thresholds = CLASS_THRESHOLDS
         
-        thresholds = CLASS_THRESHOLDS  # 从配置读取
-        
-        if max_sim < thresholds.get(pred, 0.35):
-            pred = "normal"
-            max_sim = normal_sim
+        # 对 play_phone 额外加缓冲：使用"打折后相似度 vs 阈值"时，要求超过阈值 + 0.05
+        # 解决漏洞4的硬边界问题
+        if pred == "play_phone":
+            if max_sim < thresholds.get("play_phone", 0.45) + 0.05:
+                pred = "normal"
+                max_sim = normal_sim
+        else:
+            if max_sim < thresholds.get(pred, 0.35):
+                pred = "normal"
+                max_sim = normal_sim
         
         return pred, max_sim, similarities
         
     except Exception as e:
+        logger.error(f"Protonet 分类异常: {e}")
         cls, sim = classify_crop(frame, box)
         return cls, sim, None
 
 
 def detect_and_draw(frame, conf_thres=CONF_THRES, sim_thres=SIM_THRES, iou_thres=0.50, use_class_specific=True):
-    """检测并绘制结果 - 使用配置文件参数"""
-    current_abnormal = set()
+    """检测并绘制结果 - 标签防截断 + 异常按人数计数"""
+    current_abnormal = {}  # {behavior: count}
     
     try:
         person_results = yolo(frame, classes=[0], conf=conf_thres, iou=iou_thres, verbose=False)
         
         phone_boxes = []
         try:
-            phone_results = yolo(frame, classes=[67], conf=0.25, verbose=False)
+            phone_results = yolo(frame, classes=[67], conf=0.30, verbose=False)
             for r in phone_results:
                 for box in r.boxes.xyxy:
                     phone_boxes.append(box.cpu().numpy())
         except Exception as e:
             logger.debug(f"手机检测跳过: {e}")
         
-        # 从配置读取手机匹配参数
         phone_iou = PROTONET_FIX.get("phone_iou_threshold", 0.3)
         phone_dist_mult = PROTONET_FIX.get("phone_dist_multiplier", 1.2)
-        phone_y_min = PROTONET_FIX.get("phone_y_min_ratio", 0.1)
-        phone_y_max = PROTONET_FIX.get("phone_y_max_ratio", 0.9)
+        
+        # ========== 第一阶段：检测分类，收集绘制信息 ==========
+        detections = []
+        h_frame, w_frame = frame.shape[:2]
         
         for r in person_results:
             for box in r.boxes.xyxy:
                 x1, y1, x2, y2 = map(int, box)
-                h_frame, w_frame = frame.shape[:2]
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(w_frame, x2), min(h_frame, y2)
                 
@@ -426,15 +449,20 @@ def detect_and_draw(frame, conf_thres=CONF_THRES, sim_thres=SIM_THRES, iou_thres
                     continue
                 
                 person_height = y2 - y1
+                person_width = x2 - x1
                 
-                # 检查手机（使用配置参数）
+                # 手机匹配（修正版）
                 has_phone_nearby = False
                 nearest_phone_dist = float('inf')
                 
                 for pb in phone_boxes:
                     px1, py1, px2, py2 = pb
+                    phone_cx = (px1 + px2) / 2
+                    phone_cy = (py1 + py2) / 2
                     
-                    # IoU 重叠判断
+                    if not (x1 - person_width * 0.5 <= phone_cx <= x2 + person_width * 0.5):
+                        continue
+                    
                     ix1 = max(x1, px1)
                     iy1 = max(y1, py1)
                     ix2 = min(x2, px2)
@@ -443,41 +471,42 @@ def detect_and_draw(frame, conf_thres=CONF_THRES, sim_thres=SIM_THRES, iou_thres
                     if ix2 > ix1 and iy2 > iy1:
                         inter_area = (ix2 - ix1) * (iy2 - iy1)
                         phone_area = (px2 - px1) * (py2 - py1)
-                        iou = inter_area / phone_area
-                        
-                        if iou > phone_iou:  # 从配置读取
+                        cover_ratio = inter_area / phone_area if phone_area > 0 else 0
+                        if cover_ratio > phone_iou:
                             has_phone_nearby = True
-                            phone_cy = (py1 + py2) / 2
-                            person_cy = (y1 + y2) / 2
-                            dist = abs(phone_cy - person_cy)
+                            dist = abs(phone_cy - (y1 + y2) / 2)
                             nearest_phone_dist = min(nearest_phone_dist, dist)
+                            continue
                     
-                    # 距离判断（使用配置参数）
-                    else:
-                        person_cx = (x1 + x2) / 2
-                        person_cy = (y1 + y2) / 2
-                        phone_cx = (px1 + px2) / 2
-                        phone_cy = (py1 + py2) / 2
-                        dist = ((person_cx - phone_cx) ** 2 + (person_cy - phone_cy) ** 2) ** 0.5
-                        
-                        if dist < person_height * phone_dist_mult:  # 从配置读取
-                            if py2 > y1 + person_height * phone_y_min and py1 < y1 + person_height * phone_y_max:  # 从配置读取
-                                has_phone_nearby = True
-                                nearest_phone_dist = min(nearest_phone_dist, dist)
+                    person_cx = (x1 + x2) / 2
+                    person_cy = (y1 + y2) / 2
+                    dist = ((person_cx - phone_cx) ** 2 + (person_cy - phone_cy) ** 2) ** 0.5
+                    
+                    if dist < person_height * phone_dist_mult:
+                        hand_y_min = y1 + person_height * 0.20
+                        hand_y_max = y1 + person_height * 0.90
+                        if py2 > hand_y_min and py1 < hand_y_max:
+                            has_phone_nearby = True
+                            nearest_phone_dist = min(nearest_phone_dist, dist)
                 
-                # 分类决策
+                # 分类
                 if has_phone_nearby:
                     cls_name = "play_phone"
                     sim = min(0.95, 0.75 + 0.2 * (1 - nearest_phone_dist / (person_height * 0.7)))
-                    
+                    all_sims = None
                 else:
                     if USE_PROTONET:
                         cls_name, sim, all_sims = classify_crop_protonet(frame, [x1, y1, x2, y2])
                     else:
                         cls_name, sim = classify_crop(frame, [x1, y1, x2, y2], use_class_specific)
                         all_sims = None
+
+                    # 调试输出分类器结果
+                    # if all_sims:
+                    #     logger.info(f"  → Protonet 分类: {cls_name} (sim={sim:.3f}), 全部分数: { {k: f'{v:.3f}' for k,v in all_sims.items()} }")
+                    # else:
+                    #     logger.info(f"  → CLIP 分类: {cls_name} (sim={sim:.3f})")
                     
-                    # 降级逻辑（使用配置参数）
                     fallback_gap = PROTONET_FIX.get("fallback_gap", 0.15)
                     if cls_name == "play_phone" and all_sims is not None:
                         second_best = None
@@ -486,26 +515,65 @@ def detect_and_draw(frame, conf_thres=CONF_THRES, sim_thres=SIM_THRES, iou_thres
                             if c != "play_phone" and s > second_sim:
                                 second_sim = s
                                 second_best = c
-                        
-                        if second_best and (all_sims["play_phone"] - second_sim < fallback_gap):  # 从配置读取
+                        if second_best and (all_sims["play_phone"] - second_sim < fallback_gap):
                             cls_name = second_best
                             sim = second_sim
                 
                 if cls_name not in CLASS_NAMES:
                     continue
                 
-                is_abnormal = cls_name != "normal"
-                if is_abnormal:
-                    current_abnormal.add(cls_name)
-                
-                color = (0, 0, 255) if is_abnormal else (0, 255, 0)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                
                 label = f"{cls_name} {sim:.2f}"
                 (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-                cv2.rectangle(frame, (x1, y1 - text_h - 8), (x1 + text_w, y1), color, -1)
-                cv2.putText(frame, label, (x1, y1 - 5), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                
+                detections.append({
+                    'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
+                    'cls_name': cls_name, 'sim': sim,
+                    'text_w': text_w, 'text_h': text_h, 'label': label
+                })
+                
+                if cls_name != "normal":
+                    current_abnormal[cls_name] = current_abnormal.get(cls_name, 0) + 1
+        
+        # ========== 第二阶段：计算 padding ==========
+        max_top_padding = 0
+        max_right_padding = 0
+        
+        for det in detections:
+            # 顶部：标签需要 text_h + 8 像素在 y1 上方
+            if det['y1'] < det['text_h'] + 8:
+                need_top = det['text_h'] + 8 - det['y1']
+                max_top_padding = max(max_top_padding, need_top)
+            
+            # 右侧：标签从 x1 开始向右延伸 text_w
+            if det['x1'] + det['text_w'] > w_frame:
+                need_right = det['x1'] + det['text_w'] - w_frame
+                max_right_padding = max(max_right_padding, need_right)
+        
+        top_pad = int(max_top_padding)
+        right_pad = int(max_right_padding)
+        
+        # ========== 第三阶段：扩大图片并调整坐标 ==========
+        if top_pad > 0 or right_pad > 0:
+            frame = cv2.copyMakeBorder(frame, top_pad, 0, 0, right_pad,
+                                       cv2.BORDER_CONSTANT, value=(240, 240, 240))
+            for det in detections:
+                det['y1'] += top_pad
+                det['y2'] += top_pad
+        
+        # ========== 第四阶段：绘制 ==========
+        for det in detections:
+            x1, y1, x2, y2 = det['x1'], det['y1'], det['x2'], det['y2']
+            cls_name = det['cls_name']
+            text_w, text_h = det['text_w'], det['text_h']
+            label = det['label']
+            
+            is_abnormal = cls_name != "normal"
+            color = (0, 0, 255) if is_abnormal else (0, 255, 0)
+            
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.rectangle(frame, (x1, y1 - text_h - 8), (x1 + text_w, y1), color, -1)
+            cv2.putText(frame, label, (x1, y1 - 5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
         
     except Exception as e:
         logger.error(f"检测异常: {str(e)}")
@@ -554,7 +622,15 @@ class VideoThread(QThread):
                     break
                 frame, ab = detect_and_draw(frame, self.conf_thres, self.sim_thres, self.iou_thres)
                 if self.writer:
-                    self.writer.write(frame)
+                    h_orig = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    w_orig = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    if frame.shape[0] > h_orig or frame.shape[1] > w_orig:
+                        frame_write = frame[:h_orig, :w_orig]  # 裁掉顶部和右侧 padding
+                    else:
+                        frame_write = frame
+                    self.writer.write(frame_write)
+                else:
+                    frame_write = frame
                 self.frame_signal.emit(frame, ab)
                 frame_count += 1
                 if total_frames > 0:
@@ -752,7 +828,7 @@ class MainWindow(QMainWindow):
         
         left_layout.addStretch()
         
-        version_label = QLabel("v1.3.0 | Prototypical Networks\n少样本学习")
+        version_label = QLabel("v1.4.0 | Prototypical Networks\n少样本学习")
         version_label.setStyleSheet("color: #a0aec0; font-size: 11px;")
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setWordWrap(True)
@@ -1065,15 +1141,16 @@ class MainWindow(QMainWindow):
         }
         self.session_saved = False
         
-    def log_behavior(self, behavior):
-        """记录行为"""
+    def log_behavior(self, behavior, count=1):
+        """记录行为，支持一帧多学生"""
         if self.current_session is None:
             return
-        self.current_session["behaviors"].append({
-            "behavior": behavior,
-            "time": datetime.now().strftime("%H:%M:%S"),
-            "advice": INTERVENTION_MAP.get(behavior, "")
-        })
+        for _ in range(count):
+            self.current_session["behaviors"].append({
+                "behavior": behavior,
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "advice": INTERVENTION_MAP.get(behavior, "")
+            })
 
     def save_current_session(self):
         """保存当前会话"""
@@ -1087,12 +1164,15 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logger.error(f"保存会话失败: {str(e)}")
                 
-    def show_frame(self, frame, ab_set):
-        """显示帧图像 - 更新现代化界面"""
+    def show_frame(self, frame, ab_dict):
+        """显示帧图像 - 适配异常人数统计"""
         start_time = time.time()
         
         self.current_frame = frame.copy()
-        self.current_frame_abnormal = ab_set
+        self.current_frame_abnormal = ab_dict
+        
+        # 提取异常类别集合（用于状态判断）
+        ab_set = set(k for k, v in ab_dict.items() if v > 0)
         
         if ab_set and ab_set != {"normal"}:
             self.status.setText("🔴 检测中 - 发现异常")
@@ -1101,7 +1181,7 @@ class MainWindow(QMainWindow):
             self.status.setText("🟢 检测中 - 正常")
             self.status.setStyleSheet("font-size: 12px; color: #48bb78; font-weight: bold;")
         
-        self.target_label.setText(f"🎯 检测目标: {len(ab_set)}个")
+        self.target_label.setText(f"🎯 检测目标: {sum(ab_dict.values())}个异常")
         
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
@@ -1110,18 +1190,19 @@ class MainWindow(QMainWindow):
         self.label.setPixmap(QPixmap.fromImage(q_img).scaled(
             self.label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
-        self.update_advice_panel(ab_set)
+        self.update_advice_panel(ab_dict)
         
         new_abnormal = False
-        for ab in ab_set:
-            if self.stat_manager.update(ab, self.cooldown):
+        for ab, count in ab_dict.items():
+            updated, added = self.stat_manager.update(ab, count=count, cooldown=self.cooldown)
+            if updated:
                 new_abnormal = True
                 if ab not in self.shown_behaviors:
                     self.shown_behaviors.add(ab)
-                    self.log_behavior(ab)
+                self.log_behavior(ab, count=added)
         
         if new_abnormal and ab_set:
-            self.show_merged_intervention_dialog(ab_set)
+            self.show_merged_intervention_dialog(ab_dict)
         
         self.update_stat()
         
@@ -1132,16 +1213,17 @@ class MainWindow(QMainWindow):
         self.fps_label.setText(f"FPS: {stats['current_fps']:.1f}")
         self.time_label.setText(f"⏱️ 检测耗时: {process_time/1000:.2f}s")
 
-    def update_advice_panel(self, ab_set):
+    def update_advice_panel(self, ab_dict):
         """更新右侧干预建议面板"""
         self.current_abnormal_list.clear()
+        
+        ab_set = set(k for k, v in ab_dict.items() if v > 0)
         
         if not ab_set or ab_set == {"normal"}:
             self.advice_text.setHtml("""
                 <div style="color: #5cb85c; text-align: center; padding: 20px;">
                     <h3>✅ 课堂秩序良好</h3>
                     <p>当前未检测到异常行为</p>
-                    <p>所有学生专注学习</p>
                 </div>
             """)
             self.current_abnormal_list.addItem("无异常")
@@ -1154,15 +1236,16 @@ class MainWindow(QMainWindow):
         for ab in sorted(ab_set):
             if ab == "normal":
                 continue
-                
-            item_text = f"{ab} ({datetime.now().strftime('%H:%M:%S')})"
+            
+            count = ab_dict[ab]
+            item_text = f"{ab} x{count} ({datetime.now().strftime('%H:%M:%S')})"
             self.current_abnormal_list.addItem(item_text)
             
             advice = INTERVENTION_MAP.get(ab, f"【注意】检测到 {ab} 行为")
             advice_html += f"""
                 <div style="background-color: #f8d7da; border-left: 4px solid #d9534f; 
                             padding: 10px; margin-bottom: 10px; border-radius: 4px;">
-                    <strong style="color: #721c24;">{ab}</strong><br/>
+                    <strong style="color: #721c24;">{ab} (×{count}人)</strong><br/>
                     <span style="color: #856404;">{advice}</span>
                 </div>
             """
@@ -1170,12 +1253,14 @@ class MainWindow(QMainWindow):
         advice_html += "</div>"
         self.advice_text.setHtml(advice_html)
 
-    def show_merged_intervention_dialog(self, ab_set):
+    def show_merged_intervention_dialog(self, ab_dict):
         """显示合并的干预建议弹窗"""
-        if not ab_set or ab_set == {"normal"}:
+        ab_set = set(k for k, v in ab_dict.items() if v > 0 and k != "normal")
+        if not ab_set:
             return
         
-        title = f"干预建议 - 检测到 {len([ab for ab in ab_set if ab != 'normal'])} 项异常"
+        total_persons = sum(v for k, v in ab_dict.items() if k != "normal")
+        title = f"干预建议 - {len(ab_set)} 项异常，涉及 {total_persons} 人"
         
         dialog = QDialog(self)
         dialog.setWindowTitle(title)
