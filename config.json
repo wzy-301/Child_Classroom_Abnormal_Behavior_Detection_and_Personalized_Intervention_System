@@ -6,8 +6,8 @@
     "iou_thres": 0.5,
     "class_thresholds": {
       "lie": 0.35,
-      "stand": 0.35,
-      "play_phone": 0.35,
+      "stand": 0.40,
+      "play_phone": 0.45,
       "fight": 0.35,
       "whispering": 0.38,
       "looking_around": 0.38,
@@ -15,7 +15,7 @@
     },
     "protonet_fix": {
       "phone_discount": 0.5,
-      "normal_min_for_fix2": 0.5,
+      "normal_min_for_fix2": 0.35,
       "fix2_gap_threshold": 0.1,
       "fix3_gap_threshold": 0.1,
       "fallback_gap": 0.15,
@@ -26,8 +26,8 @@
     }
   },
   "ui": {
-    "window_width": 1670,
-    "window_height": 892,
+    "window_width": 1854,
+    "window_height": 1011,
     "theme": "light"
   },
   "paths": {
