@@ -6,8 +6,8 @@
     "iou_thres": 0.5,
     "class_thresholds": {
       "lie": 0.35,
-      "stand": 0.4,
-      "play_phone": 0.45,
+      "stand": 0.35,
+      "play_phone": 0.35,
       "fight": 0.35,
       "whispering": 0.38,
       "looking_around": 0.38,
@@ -26,8 +26,8 @@
     }
   },
   "ui": {
-    "window_width": 1854,
-    "window_height": 1011,
+    "window_width": 1670,
+    "window_height": 892,
     "theme": "light"
   },
   "paths": {
