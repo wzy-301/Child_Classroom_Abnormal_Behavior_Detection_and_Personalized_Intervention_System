@@ -6,12 +6,12 @@
     "iou_thres": 0.5,
     "class_thresholds": {
       "lie": 0.35,
-      "stand": 0.40,
-      "play_phone": 0.45,
-      "fight": 0.35,
-      "whispering": 0.38,
-      "looking_around": 0.38,
-      "normal": 0.25
+      "stand": 0.45,
+      "play_phone": 0.35,
+      "fight": 0.25,
+      "whispering": 0.42,
+      "looking_around": 0.42,
+      "normal": 0.15
     },
     "protonet_fix": {
       "phone_discount": 0.5,
