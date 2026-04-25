@@ -51,15 +51,15 @@ CLASS_DESCRIPTIONS_MULTI = {
 }
 
 # 策略2: 负样本描述 - 明确说明不是什么
-NEGATIVE_DESCRIPTIONS = {
-    "normal": "student not sleeping, not using phone, NO mobile device, NO electronic gadget, not talking",
-    "lie": "student not sitting upright, not paying attention, head down",
-    "stand": "student not seated, not in chair, standing on feet",
-    "play_phone": "student not listening, not looking at teacher, using phone",
-    "fight": "students not peaceful, physical conflict, aggressive",
-    "whispering": "students not silent, talking to each other, not listening",
-    "looking_around": "student not focused, distracted gaze, wandering attention"
-}
+# NEGATIVE_DESCRIPTIONS = {
+#     "normal": "student not sleeping, not using phone, NO mobile device, NO electronic gadget, not talking",
+#     "lie": "student not sitting upright, not paying attention, head down",
+#     "stand": "student not seated, not in chair, standing on feet",
+#     "play_phone": "student not listening, not looking at teacher, using phone",
+#     "fight": "students not peaceful, physical conflict, aggressive",
+#     "whispering": "students not silent, talking to each other, not listening",
+#     "looking_around": "student not focused, distracted gaze, wandering attention"
+# }
 
 def build_enhanced_prototypes():
     """
@@ -116,26 +116,26 @@ def build_enhanced_prototypes():
         text_feat = torch.cat(text_feats).mean(dim=0, keepdim=True)
         
         # 3. 负样本约束（降低与负描述的相似度）
-        neg_desc = NEGATIVE_DESCRIPTIONS.get(c, "")
-        if neg_desc:
-            neg_tokens = clip.tokenize([neg_desc]).to(DEVICE)
-            with torch.no_grad():
-                neg_feat = model.encode_text(neg_tokens)
-                neg_feat = neg_feat / neg_feat.norm(dim=-1, keepdim=True)
-                neg_feat = neg_feat.cpu()
-        else:
-            neg_feat = None
+        # neg_desc = NEGATIVE_DESCRIPTIONS.get(c, "")
+        # if neg_desc:
+        #     neg_tokens = clip.tokenize([neg_desc]).to(DEVICE)
+        #     with torch.no_grad():
+        #         neg_feat = model.encode_text(neg_tokens)
+        #         neg_feat = neg_feat / neg_feat.norm(dim=-1, keepdim=True)
+        #         neg_feat = neg_feat.cpu()
+        # else:
+        #     neg_feat = None
         
         # 4. 图像聚类生成多原型（每个类别3-5个原型）
-        n_clusters = min(5, len(img_feats))
-        if n_clusters > 2:
+        n_clusters = min(3, len(img_feats) // 8 + 1)
+        if n_clusters < 2:
+            centers = img_feats.mean(dim=0, keepdim=True)
+        else:
             kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
             kmeans.fit(img_feats.numpy())
             centers = torch.from_numpy(kmeans.cluster_centers_).float()
-            centers = centers / centers.norm(dim=1, keepdim=True)
-        else:
-            centers = img_feats.mean(dim=0, keepdim=True)
-            centers = centers / centers.norm(dim=-1, keepdim=True)
+
+        centers = centers / centers.norm(dim=1, keepdim=True)
         
         # 5. 融合策略：图像原型 + 文本引导 + 负样本约束
         # 每个图像原型与文本特征融合
@@ -147,10 +147,10 @@ def build_enhanced_prototypes():
             combined = img_p + 0.4 * text_feat
             
             # 负样本约束：远离负描述（如果相似度高，则调整）
-            if neg_feat is not None:
-                neg_sim = torch.cosine_similarity(combined, neg_feat).item()
-                if neg_sim > 0.5:  # 如果与负描述太像，降低权重
-                    combined = combined - 0.2 * neg_feat
+            # if neg_feat is not None:
+            #     neg_sim = torch.cosine_similarity(combined, neg_feat).item()
+            #     if neg_sim > 0.5:  # 如果与负描述太像，降低权重
+            #         combined = combined - 0.2 * neg_feat
             
             combined = combined / combined.norm(dim=-1, keepdim=True)
             enhanced_protos.append(combined)
