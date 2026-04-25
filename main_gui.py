@@ -286,7 +286,13 @@ def classify_crop(frame, box, use_class_specific=True):
         max_sim = -1
         pred = "unknown"
         for cls, proto in prototypes.items():
-            sim = torch.cosine_similarity(feat, proto.to(DEVICE)).item()
+            proto = proto.to(DEVICE)
+            # 多原型时取最大相似度
+            if proto.dim() == 2 and proto.shape[0] > 1:
+                sims = torch.cosine_similarity(feat, proto)  # (n_proto,)
+                sim = sims.max().item()
+            else:
+                sim = torch.cosine_similarity(feat, proto).item()
             threshold = CLASS_THRESHOLDS.get(cls, SIM_THRES)
             condition = sim > threshold
             if condition and sim > max_sim:
@@ -303,7 +309,7 @@ def classify_crop(frame, box, use_class_specific=True):
         return "normal", 0
 
 def classify_crop_protonet(frame, box):
-    """Prototypical Networks 分类"""
+    """Prototypical Networks 分类 - 多层保护防止正常行为误判"""
     try:
         if PROTOTYPICAL_MODEL is None or PROTOTYPES_PROTO is None:
             cls, sim = classify_crop(frame, box)
@@ -326,55 +332,68 @@ def classify_crop_protonet(frame, box):
         
         with torch.no_grad():
             feat = PROTOTYPICAL_MODEL(img)
-            feat = feat / feat.norm(dim=-1, keepdim=True)
         
         similarities = {}
         for cls_name, proto in PROTOTYPES_PROTO.items():
             proto = proto.to(DEVICE)
-            dist = torch.cdist(feat, proto).item()
-            sim = np.exp(-dist**2 / (2 * 0.5**2))
+            sim = torch.cosine_similarity(feat, proto).item()
             similarities[cls_name] = sim
         
         # 保留原始 normal 值（后续多次使用）
         normal_sim = similarities.get("normal", 0)
         
         # ========== 第1层：play_phone 打折（无手机验证时）==========
+        # play_phone 原型容易与低头、手放桌上等正常姿态混淆，先打折降低虚高
         discount = PROTONET_FIX.get("phone_discount", 0.5)
         if "play_phone" in similarities:
             similarities["play_phone"] *= discount
         
-        # ========== 第2层：通用模糊保护（所有异常类）==========
-        # 核心逻辑：如果最高异常类只比 normal 高一点点，说明模型不确定，优先 normal
-        # 这是课堂场景的关键保护（正常行为占绝大多数）
+        # ========== 第2层：强 normal 绝对值保护（核心新增）==========
+        # 当 normal 已经较高（>=0.28），除非某个异常类显著领先（>=0.12），否则强制判 normal
+        # 这是防止 looking_around/whispering 擦线误判的最强屏障
+        if normal_sim >= 0.28:
+            best_abnormal = None
+            best_abnormal_sim = 0
+            for cls in ["lie", "stand", "play_phone", "fight", "whispering", "looking_around"]:
+                s = similarities.get(cls, 0)
+                if s > best_abnormal_sim:
+                    best_abnormal_sim = s
+                    best_abnormal = cls
+            
+            # 差距不够大 → 模型其实不确定，优先 normal（课堂里 normal 占绝对多数，这是合理先验）
+            if best_abnormal and (best_abnormal_sim - normal_sim) < 0.12:
+                return "normal", normal_sim, similarities
+        
+        # ========== 第3层：通用模糊保护 ==========
         pred = max(similarities, key=similarities.get)
         max_sim = similarities[pred]
         
-        # 通用保守策略：最高异常类与 normal 的差距 < 0.08 且 normal 不算太低 → 优先 normal
         if pred != "normal":
             gap = max_sim - normal_sim
-            # 0.08 的 gap 阈值：经验值，可根据实际场景在 0.05~0.12 之间调整
-            if gap < 0.08 and normal_sim > 0.20:
+            # 扩大 gap 阈值到 0.10，更保守
+            if gap < 0.10 and normal_sim > 0.18:
                 return "normal", normal_sim, similarities
         
-        # ========== 第3层：修复2（normal 较高时的优先保护）==========
-        normal_min = PROTONET_FIX.get("normal_min_for_fix2", 0.35)
-        fix2_gap = PROTONET_FIX.get("fix2_gap_threshold", 0.1)
-        
-        if normal_sim >= normal_min:
-            best_abnormal_sim = 0
-            for cls in ["lie", "stand", "play_phone", "fight", "whispering", "looking_around"]:
-                if similarities.get(cls, 0) > best_abnormal_sim:
-                    best_abnormal_sim = similarities[cls]
+        # ========== 第4层：looking_around & whispering 专属降级 ==========
+        # 这两个类最容易与 normal 混淆，需要额外一层精细保护
+        if pred in ["looking_around", "whispering"]:
+            second_best = None
+            second_sim = 0
+            for c, s in similarities.items():
+                if c != pred and s > second_sim:
+                    second_sim = s
+                    second_best = c
             
-            # 如果最高异常类与 normal 差距很小，返回 normal
-            if best_abnormal_sim - normal_sim < fix2_gap:
+            # 如果第二名是 normal 且差距很小（<0.06），说明几乎是 normal，降级
+            if second_best == "normal" and (max_sim - second_sim) < 0.06:
+                return "normal", second_sim, similarities
+            
+            # 如果第二名也是异常类但差距极小（<0.04），说明模型整体混乱，返回 normal
+            if second_best and second_best != "normal" and (max_sim - second_sim) < 0.04:
                 return "normal", normal_sim, similarities
         
-        # ========== 第4层：play_phone 专属降级（打折后仍最高）==========
-        fix3_gap = PROTONET_FIX.get("fix3_gap_threshold", 0.1)
-        
+        # ========== 第5层：play_phone 专属降级 ==========
         if pred == "play_phone":
-            # 找第二名（不含 play_phone）
             second_best = None
             second_sim = 0
             for c, s in similarities.items():
@@ -382,29 +401,26 @@ def classify_crop_protonet(frame, box):
                     second_sim = s
                     second_best = c
             
-            if second_best and second_sim > 0.01:  # 第二名必须有一定分数才考虑
-                # 如果第二名和 normal 很接近（差距 < 0.1），说明整体模糊，返回 normal
-                if second_sim - normal_sim < fix3_gap:
+            if second_best and second_sim > 0.01:
+                if second_sim - normal_sim < 0.10:
                     return "normal", normal_sim, similarities
-                # 否则降级为第二名（如 stand、looking_around 等）
                 else:
                     return second_best, second_sim, similarities
-            else:
-                # 只有 play_phone 有值，其他都极低 → 返回 play_phone（但仍保留 similarities 供后续 fix4 使用）
-                # return "normal", normal_sim, similarities
-                return "play_phone", similarities[pred], similarities
         
-        # ========== 第5层：最终阈值过滤 ==========
+        # ========== 第6层：阈值过滤（大幅提高 looking_around/whispering 门槛）==========
         thresholds = CLASS_THRESHOLDS
         
-        # 对 play_phone 额外加缓冲：使用"打折后相似度 vs 阈值"时，要求超过阈值 + 0.05
-        # 解决漏洞4的硬边界问题
         if pred == "play_phone":
-            if max_sim < thresholds.get("play_phone", 0.45) + 0.05:
+            if max_sim < thresholds.get("play_phone", 0.35) + 0.05:
+                pred = "normal"
+                max_sim = normal_sim
+        elif pred in ["looking_around", "whispering"]:
+            # 大幅提高门槛：必须非常确信才输出这两个类
+            if max_sim < thresholds.get(pred, 0.42):
                 pred = "normal"
                 max_sim = normal_sim
         else:
-            if max_sim < thresholds.get(pred, 0.35):
+            if max_sim < thresholds.get(pred, 0.30):
                 pred = "normal"
                 max_sim = normal_sim
         
@@ -413,7 +429,7 @@ def classify_crop_protonet(frame, box):
     except Exception as e:
         logger.error(f"Protonet 分类异常: {e}")
         cls, sim = classify_crop(frame, box)
-        return cls, sim, None
+        return cls, sim, Non
 
 
 def detect_and_draw(frame, conf_thres=CONF_THRES, sim_thres=SIM_THRES, iou_thres=0.50, use_class_specific=True):
@@ -828,7 +844,7 @@ class MainWindow(QMainWindow):
         
         left_layout.addStretch()
         
-        version_label = QLabel("v1.4.0 | Prototypical Networks\n少样本学习")
+        version_label = QLabel("v1.5.0 | Prototypical Networks\n少样本学习")
         version_label.setStyleSheet("color: #a0aec0; font-size: 11px;")
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setWordWrap(True)
@@ -1671,7 +1687,7 @@ class MainWindow(QMainWindow):
         """显示关于对话框"""
         about_text = """
         <h3>儿童课堂异常行为检测与干预系统</h3>
-        <p><b>版本:</b> 1.2.0</p>
+        <p><b>版本:</b> 1.5.0</p>
         <p><b>技术架构:</b></p>
         <ul>
             <li>目标检测: YOLOv8</li>
