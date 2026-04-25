@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models, transforms
@@ -113,7 +114,7 @@ class PrototypicalNetwork(nn.Module):
 
 class EpisodeSampler:
     """Episode 采样器 - 少样本学习的核心"""
-    def __init__(self, dataset, n_way=5, k_shot=5, n_query=15):
+    def __init__(self, dataset, indices=None, n_way=7, k_shot=5, n_query=15):
         self.dataset = dataset
         self.n_way = n_way  # 每轮选几个类别
         self.k_shot = k_shot  # 每类几张 support
@@ -121,7 +122,9 @@ class EpisodeSampler:
         
         # 按类别组织数据
         self.class_to_indices = {}
-        for idx, (_, label, _) in enumerate(dataset.samples):
+        source = indices if indices is not None else range(len(dataset.samples))
+        for idx in source:
+            _, label, _ = dataset.samples[idx]
             if label not in self.class_to_indices:
                 self.class_to_indices[label] = []
             self.class_to_indices[label].append(idx)
@@ -140,7 +143,8 @@ class EpisodeSampler:
             indices = self.class_to_indices[original_label]
             
             # 随机选 k_shot + n_query 张
-            selected = random.sample(indices, self.k_shot + self.n_query)
+            n_needed = min(self.k_shot + self.n_query, len(indices))
+            selected = random.sample(indices, n_needed)
             
             # 前 k_shot 张为 support
             for idx in selected[:self.k_shot]:
@@ -149,10 +153,15 @@ class EpisodeSampler:
                 support_labels.append(new_label)
             
             # 后 n_query 张为 query
-            for idx in selected[self.k_shot:]:
+            for idx in selected[self.k_shot:n_needed]:
                 img, _, _ = self.dataset[idx]
                 query_images.append(img)
                 query_labels.append(new_label)
+        
+        # 如果 query 为空（验证集样本极少时），从 support 复制一张兜底
+        if len(query_images) == 0:
+            query_images.append(support_images[0].clone())
+            query_labels.append(support_labels[0])
         
         return (torch.stack(support_images), torch.tensor(support_labels),
                 torch.stack(query_images), torch.tensor(query_labels))
@@ -161,7 +170,7 @@ class EpisodeSampler:
 # ========== 4. 训练逻辑 ==========
 
 def compute_prototypes(embeddings, labels):
-    """计算原型（每类特征的平均）"""
+    """计算原型（每类特征的平均，并重新 L2 归一化）"""
     n_way = len(torch.unique(labels))
     prototypes = torch.zeros(n_way, embeddings.shape[1]).to(embeddings.device)
     
@@ -169,32 +178,34 @@ def compute_prototypes(embeddings, labels):
         mask = labels == i
         prototypes[i] = embeddings[mask].mean(dim=0)
     
+    # 重新归一化，确保原型在单位球面上（与点积/余弦度量一致）
+    prototypes = nn.functional.normalize(prototypes, p=2, dim=1)
     return prototypes
 
-def euclidean_distance(a, b):
-    """计算欧氏距离"""
-    # a: [n, d], b: [m, d]
-    # 返回: [n, m]
-    n = a.shape[0]
-    m = b.shape[0]
-    a = a.unsqueeze(1).expand(n, m, -1)
-    b = b.unsqueeze(0).expand(n, m, -1)
-    return torch.pow(a - b, 2).sum(2)
-
-def train_protonet(model, episode_sampler, epochs=1000, lr=0.001):
-    """训练原型网络"""
+def train_protonet(model, train_sampler, val_sampler, epochs=2000, lr=0.001):
+    """训练原型网络 - 冻结 backbone，只训练 projector，带验证早停"""
     model = model.to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=300, gamma=0.5)
     
-    model.train()
-    best_loss = float('inf')
+    # 冻结 backbone，只优化 projector
+    for param in model.encoder.parameters():
+        param.requires_grad = False
+    optimizer = optim.Adam(model.projector.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     
-    print(f"\\n开始训练: {epochs} episodes, n_way={episode_sampler.n_way}, k_shot={episode_sampler.k_shot}")
+    best_val_acc = 0
+    patience = 300
+    no_improve = 0
+    
+    print(f"\n开始训练: 最大 {epochs} epochs, n_way={train_sampler.n_way}, k_shot={train_sampler.k_shot}")
+    print("Backbone 已冻结，仅训练 projector")
     
     for epoch in tqdm(range(epochs)):
+        # 混合模式：backbone eval（保持预训练 BN 统计量），projector train
+        model.encoder.eval()
+        model.projector.train()
+        
         # 采样 episode
-        support_x, support_y, query_x, query_y = episode_sampler.sample_episode()
+        support_x, support_y, query_x, query_y = train_sampler.sample_episode()
         
         support_x = support_x.to(DEVICE)
         query_x = query_x.to(DEVICE)
@@ -208,14 +219,11 @@ def train_protonet(model, episode_sampler, epochs=1000, lr=0.001):
         # 计算原型
         prototypes = compute_prototypes(support_embeddings, support_y)
         
-        # 计算 query 到原型的距离
-        distances = euclidean_distance(query_embeddings, prototypes)
-        
-        # 距离转概率（负距离越大，概率越高）
-        log_probs = -distances
+        # 点积作为 logits（对于 L2 归一化向量 = 余弦相似度）
+        logits = query_embeddings @ prototypes.T
         
         # 计算损失
-        loss = nn.functional.cross_entropy(log_probs, query_y)
+        loss = F.cross_entropy(logits, query_y)
         
         # 反向传播
         optimizer.zero_grad()
@@ -223,22 +231,25 @@ def train_protonet(model, episode_sampler, epochs=1000, lr=0.001):
         optimizer.step()
         scheduler.step()
         
-        # 记录最佳模型
-        if loss.item() < best_loss:
-            best_loss = loss.item()
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'epoch': epoch,
-                'loss': best_loss,
-                'class_to_idx': episode_sampler.dataset.class_to_idx,
-                'feature_dim': model.feature_dim
-            }, 'protonet_best.pth')
-        
-        if (epoch + 1) % 100 == 0:
-            print(f"\\nEpoch {epoch+1}/{epochs}, Loss: {loss.item():.4f}, Best: {best_loss:.4f}")
+        # 每 50 个 episode 验证一次
+        if (epoch + 1) % 50 == 0:
+            val_acc = evaluate(model, val_sampler, n_episodes=50)
+            
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                no_improve = 0
+                torch.save(model.state_dict(), 'protonet_best.pth')
+            else:
+                no_improve += 50
+            
+            print(f"\nEpoch {epoch+1}/{epochs}, Loss: {loss.item():.4f}, Val Acc: {val_acc:.2f}%, Best: {best_val_acc:.2f}%")
+            
+            # if no_improve >= patience:
+            #     print(f"\n早停于 Epoch {epoch+1}，最佳验证准确率: {best_val_acc:.2f}%")
+            #     break
     
-    print(f"\\n训练完成! 最佳损失: {best_loss:.4f}")
-    print("模型已保存到: protonet_best.pth")
+    print(f"\n训练完成! 最佳验证准确率: {best_val_acc:.2f}%")
+    print("最佳模型已保存到: protonet_best.pth")
     
     return model
 
@@ -246,7 +257,7 @@ def train_protonet(model, episode_sampler, epochs=1000, lr=0.001):
 # ========== 5. 评估 ==========
 
 def evaluate(model, episode_sampler, n_episodes=100):
-    """评估模型准确率"""
+    """评估模型准确率 - 使用点积（与训练一致）"""
     model.eval()
     correct = 0
     total = 0
@@ -263,14 +274,15 @@ def evaluate(model, episode_sampler, n_episodes=100):
             query_embeddings = model(query_x)
             
             prototypes = compute_prototypes(support_embeddings, support_y)
-            distances = euclidean_distance(query_embeddings, prototypes)
             
-            predictions = distances.argmin(dim=1)
+            # 与训练一致：点积（对于单位向量 = 余弦相似度）
+            logits = query_embeddings @ prototypes.T
+            predictions = logits.argmax(dim=1)
+            
             correct += (predictions == query_y).sum().item()
             total += query_y.size(0)
     
     accuracy = correct / total * 100
-    print(f"\\n评估结果: {correct}/{total} = {accuracy:.2f}%")
     return accuracy
 
 
@@ -299,7 +311,7 @@ def generate_prototypes_for_gui(model, dataset, save_path='protonet_prototypes.p
                 feat = model(img)
                 features.append(feat.cpu())
             
-            # 计算原型
+            # 计算原型（均值后归一化）
             proto = torch.cat(features).mean(dim=0, keepdim=True)
             proto = nn.functional.normalize(proto, p=2, dim=1)
             
@@ -307,10 +319,13 @@ def generate_prototypes_for_gui(model, dataset, save_path='protonet_prototypes.p
             prototypes[class_name] = proto
             class_names[class_idx] = class_name
     
+    # 按 class_idx 排序，确保顺序稳定
+    sorted_class_names = [class_names[i] for i in sorted(class_names.keys())]
+    
     # 保存
     torch.save({
         'prototypes': prototypes,
-        'class_names': list(class_names.values()),
+        'class_names': sorted_class_names,
         'class_to_idx': dataset.class_to_idx,
         'model_config': {
             'feature_dim': model.feature_dim,
@@ -318,12 +333,38 @@ def generate_prototypes_for_gui(model, dataset, save_path='protonet_prototypes.p
         }
     }, save_path)
     
-    print(f"\\nGUI 原型文件已保存到: {save_path}")
-    print(f"类别: {list(prototypes.keys())}")
+    print(f"\nGUI 原型文件已保存到: {save_path}")
+    print(f"类别: {sorted_class_names}")
     return prototypes
 
 
-# ========== 7. 主函数 ==========
+# ========== 7. 辅助函数 ==========
+
+def split_dataset(dataset, k_shot=5):
+    """
+    每类固定抽取 k_shot 张作为验证集，其余为训练集
+    保证验证集覆盖全部类别
+    """
+    class_to_indices = {}
+    for idx, (_, label, _) in enumerate(dataset.samples):
+        if label not in class_to_indices:
+            class_to_indices[label] = []
+        class_to_indices[label].append(idx)
+    
+    train_indices = []
+    val_indices = []
+    
+    for class_idx, indices in class_to_indices.items():
+        random.shuffle(indices)
+        # 确保每类至少有 k_shot 张用于验证
+        n_val = min(k_shot, len(indices))
+        val_indices.extend(indices[:n_val])
+        train_indices.extend(indices[n_val:])
+    
+    return train_indices, val_indices
+
+
+# ========== 8. 主函数 ==========
 
 def main():
     print("="*60)
@@ -332,7 +373,7 @@ def main():
     print("="*60)
     
     # 加载数据
-    print("\\n[1/4] 加载数据集...")
+    print("\n[1/5] 加载数据集...")
     dataset = BehaviorDataset(root_dir="./images", transform=train_transform)
     
     if len(dataset) == 0:
@@ -342,37 +383,42 @@ def main():
     num_classes = len(dataset.class_to_idx)
     print(f"类别数: {num_classes}")
     
-    # 创建 episode 采样器
-    # n_way: 每轮选几个类别（建议等于总类别数或稍小）
-    # k_shot: 每类几张 support（你的数据量决定）
-    n_way = num_classes  # 如果类别少，就用全部
-    k_shot = 5  # 每类取 5 张作为 support
+    # 划分训练集/验证集
+    print("\n[2/5] 划分训练集/验证集（每类 5 张验证）...")
+    train_indices, val_indices = split_dataset(dataset, k_shot=5)
+    print(f"训练集: {len(train_indices)} 张, 验证集: {len(val_indices)} 张")
     
-    print(f"\\n[2/4] 创建 Episode 采样器 (n_way={n_way}, k_shot={k_shot})...")
-    sampler = EpisodeSampler(dataset, n_way=n_way, k_shot=k_shot, n_query=10)
+    # 创建 episode 采样器
+    n_way = num_classes
+    k_shot = 5
+    
+    print(f"\n[3/5] 创建 Episode 采样器...")
+    train_sampler = EpisodeSampler(dataset, indices=train_indices, n_way=n_way, k_shot=k_shot, n_query=10)
+    # 验证集样本少，k_shot 和 n_query 都设小一点
+    val_sampler = EpisodeSampler(dataset, indices=val_indices, n_way=n_way, k_shot=3, n_query=2)
     
     # 创建模型
-    print(f"\\n[3/4] 创建 Prototypical Network...")
+    print(f"\n[4/5] 创建 Prototypical Network...")
     model = PrototypicalNetwork(num_classes=num_classes, feature_dim=128)
     
     # 统计参数量
     total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    trainable_params = sum(p.numel() for p in model.projector.parameters() if p.requires_grad)
     print(f"总参数量: {total_params:,}")
-    print(f"可训练参数量: {trainable_params:,}")
+    print(f"可训练参数量 (projector): {trainable_params:,}")
     
     # 训练
-    print(f"\\n[4/4] 开始训练...")
-    model = train_protonet(model, sampler, epochs=1000, lr=0.001)
+    print(f"\n[5/5] 开始训练...")
+    model = train_protonet(model, train_sampler, val_sampler, epochs=2000, lr=0.001)
     
     # 评估
-    print("\\n" + "="*60)
-    print("评估模型性能...")
+    print("\n" + "="*60)
+    print("最终评估（训练集采样）...")
     print("="*60)
-    evaluate(model, sampler, n_episodes=100)
+    evaluate(model, train_sampler, n_episodes=100)
     
     # 生成 GUI 使用的原型文件
-    print("\\n" + "="*60)
+    print("\n" + "="*60)
     print("生成 GUI 原型文件...")
     print("="*60)
     
@@ -380,17 +426,22 @@ def main():
     test_dataset = BehaviorDataset(root_dir="./images", transform=test_transform)
     generate_prototypes_for_gui(model, test_dataset, 'protonet_prototypes.pth')
     
-    # 同时保存完整模型
-    torch.save(model.state_dict(), 'protonet_model.pth')
-    print("完整模型已保存到: protonet_model.pth")
+    # 同时保存完整模型（优先用早停保存的最佳模型）
+    if os.path.exists('protonet_best.pth'):
+        best_state = torch.load('protonet_best.pth', map_location=DEVICE)
+        torch.save(best_state, 'protonet_model.pth')
+        print("\n已加载最佳验证模型保存为 protonet_model.pth")
+    else:
+        torch.save(model.state_dict(), 'protonet_model.pth')
     
-    print("\\n" + "="*60)
+    print("\n完整模型已保存到: protonet_model.pth")
+    
+    print("\n" + "="*60)
     print("训练完成！")
     print("="*60)
-    print("\\n请修改 main_gui.py 以使用新模型:")
-    print("1. 加载 protonet_model.pth 作为特征提取器")
-    print("2. 加载 protonet_prototypes.pth 作为分类原型")
-    print("3. 替换 classify_crop 函数为距离计算方式")
+    print("\n请确保 main_gui.py 已配置为加载:")
+    print("1. protonet_model.pth 作为特征提取器")
+    print("2. protonet_prototypes.pth 作为分类原型")
 
 
 if __name__ == "__main__":
