@@ -424,6 +424,12 @@ def classify_crop_protonet(frame, box):
                 pred = "normal"
                 max_sim = normal_sim
         
+        # ========== 第7层：全局低置信度兜底（新增）==========
+        # 如果所有类别中的最高分都低于 0.30，说明模型整体不确定，强制判 normal
+        # 这是最后一道保险，防止模型在"似像非像"时乱猜
+        if max_sim < 0.30:
+            return "normal", normal_sim, similarities
+        
         return pred, max_sim, similarities
         
     except Exception as e:
@@ -612,8 +618,10 @@ class VideoThread(QThread):
         self.sim_thres = sim_thres
         self.iou_thres = iou_thres
         self.running = True
+        self.paused = False
         self.writer = None
         self.cap = None
+        self.seek_target = None
 
     def run(self):
         try:
@@ -633,6 +641,21 @@ class VideoThread(QThread):
                 self.writer = cv2.VideoWriter(self.save_path, fourcc, fps, (w, h))
 
             while self.running:
+                # 暂停等待
+                while self.paused:
+                    time.sleep(0.05)
+                    if not self.running:
+                        break
+                
+                if not self.running:
+                    break
+
+                # ========== 处理跳转 ==========
+                if self.seek_target is not None:
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.seek_target)
+                    frame_count = self.seek_target
+                    self.seek_target = None
+
                 ret, frame = self.cap.read()
                 if not ret:
                     break
@@ -744,6 +767,9 @@ class MainWindow(QMainWindow):
         
         self.init_window()
         self.initUI()
+        # 3秒行为确认机制
+        self.behavior_confirmation = {}  # {behavior: {'first_seen': datetime, 'last_seen': datetime, 'confirmed': bool, 'count': int}}
+        self.confirmation_duration = 3.0  # 持续3秒才确认
         self.load_history()
         
     def init_window(self):
@@ -785,7 +811,7 @@ class MainWindow(QMainWindow):
         left_panel.setMaximumWidth(250)
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(20, 20, 20, 20)
-        left_layout.setSpacing(12)
+        left_layout.setSpacing(8)
         
         nav_title = QLabel("🎓 儿童课堂异常行为检测")
         nav_title.setStyleSheet("""
@@ -808,7 +834,8 @@ class MainWindow(QMainWindow):
         nav_buttons = [
             ("📷 摄像头", self.open_cam),
             ("🖼️ 图片检测", self.open_img),
-            ("🎬 视频保存", self.open_video_save),
+            ("🎬 视频检测", self.open_video),
+            ("💾 视频保存", self.open_video_save),
             ("⏹️ 停止检测", self.stop_all),
             ("💾 保存图片", self.save_img),
             ("🔄 重置统计", self.reset_stats),
@@ -818,6 +845,38 @@ class MainWindow(QMainWindow):
             ("ℹ️ 关于系统", self.show_about_dialog),
         ]
         
+        # 暂停/继续按钮（单独创建，便于动态更新文字和状态）
+        self.pause_btn = QPushButton("⏸️ 暂停")
+        self.pause_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #f6ad55;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 6px 18px;
+                font-size: 13px;
+                font-weight: 500;
+                text-align: left;
+                min-height: 32px;
+            }
+            QPushButton:hover {
+                background-color: #ed8936;
+            }
+            QPushButton:pressed {
+                background-color: #dd6b20;
+            }
+            QPushButton:disabled {
+                background-color: #cbd5e0;
+                color: #a0aec0;
+            }
+        """)
+        self.pause_btn.clicked.connect(self.pause_resume)
+        self.pause_btn.setEnabled(False)  # 初始未运行，禁用
+        left_layout.addWidget(self.pause_btn)
+        
+        # 加个小间距，和下面的功能按钮区分开
+        left_layout.addSpacing(8)
+
         for text, callback in nav_buttons:
             btn = QPushButton(text)
             btn.setStyleSheet("""
@@ -826,11 +885,11 @@ class MainWindow(QMainWindow):
                     color: white;
                     border: none;
                     border-radius: 8px;
-                    padding: 10px 18px;
+                    padding: 6px 18px;
                     font-size: 13px;
                     font-weight: 500;
                     text-align: left;
-                    min-height: 40px;
+                    min-height: 32px;
                 }
                 QPushButton:hover {
                     background-color: #46b8da;
@@ -840,6 +899,7 @@ class MainWindow(QMainWindow):
                 }
             """)
             btn.clicked.connect(callback)
+            btn.setFocusPolicy(Qt.NoFocus)
             left_layout.addWidget(btn)
         
         left_layout.addStretch()
@@ -968,21 +1028,31 @@ class MainWindow(QMainWindow):
         center_layout.addWidget(video_container, stretch=1)
         
         # 进度条
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setStyleSheet("""
-            QProgressBar {
-                background-color: #e0e6ed;
-                border-radius: 5px;
+        self.progress_slider = QSlider(Qt.Horizontal)
+        self.progress_slider.setVisible(False)
+        self.progress_slider.setRange(0, 100)
+        self.progress_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
                 height: 8px;
-                text-align: center;
+                background: #e0e6ed;
+                border-radius: 4px;
             }
-            QProgressBar::chunk {
-                background-color: #5bc0de;
-                border-radius: 5px;
+            QSlider::handle:horizontal {
+                background: #5bc0de;
+                width: 16px;
+                height: 16px;
+                border-radius: 8px;
+                margin: -4px 0;
+            }
+            QSlider::sub-page:horizontal {
+                background: #5bc0de;
+                border-radius: 4px;
             }
         """)
-        center_layout.addWidget(self.progress_bar)
+        self.is_seeking = False  # 标志：是否正在拖动
+        self.progress_slider.sliderPressed.connect(self.on_slider_pressed)
+        self.progress_slider.sliderReleased.connect(self.on_slider_released)
+        center_layout.addWidget(self.progress_slider)
         
         # 统计信息
         self.stat_label = QLabel("📊 异常行为统计：暂无数据")
@@ -1142,6 +1212,7 @@ class MainWindow(QMainWindow):
         
         self.shown_behaviors = set()
         self.stat_manager.reset_session()
+        self.behavior_confirmation.clear()
         
         self.current_session = {
             "type": session_type,
@@ -1190,12 +1261,16 @@ class MainWindow(QMainWindow):
         # 提取异常类别集合（用于状态判断）
         ab_set = set(k for k, v in ab_dict.items() if v > 0)
         
-        if ab_set and ab_set != {"normal"}:
-            self.status.setText("🔴 检测中 - 发现异常")
-            self.status.setStyleSheet("font-size: 12px; color: #fc8181; font-weight: bold;")
-        else:
-            self.status.setText("🟢 检测中 - 正常")
-            self.status.setStyleSheet("font-size: 12px; color: #48bb78; font-weight: bold;")
+        # 暂停时不覆盖状态栏（避免覆盖 ⏸️ 已暂停）
+        is_paused = self.thread and self.thread.isRunning() and getattr(self.thread, 'paused', False)
+        
+        if not is_paused:
+            if ab_set and ab_set != {"normal"}:
+                self.status.setText("🔴 检测中 - 发现异常")
+                self.status.setStyleSheet("font-size: 12px; color: #fc8181; font-weight: bold;")
+            else:
+                self.status.setText("🟢 检测中 - 正常")
+                self.status.setStyleSheet("font-size: 12px; color: #48bb78; font-weight: bold;")
         
         self.target_label.setText(f"🎯 检测目标: {sum(ab_dict.values())}个异常")
         
@@ -1208,17 +1283,71 @@ class MainWindow(QMainWindow):
 
         self.update_advice_panel(ab_dict)
         
-        new_abnormal = False
-        for ab, count in ab_dict.items():
-            updated, added = self.stat_manager.update(ab, count=count, cooldown=self.cooldown)
-            if updated:
-                new_abnormal = True
-                if ab not in self.shown_behaviors:
-                    self.shown_behaviors.add(ab)
-                self.log_behavior(ab, count=added)
+        # 判断是否是图片检测模式
+        is_image_mode = self.current_session and self.current_session.get("type") == "image"
         
-        if new_abnormal and ab_set:
-            self.show_merged_intervention_dialog(ab_dict)
+        if is_image_mode:
+            # ========== 图片检测：即时确认 ==========
+            new_abnormal = False
+            for ab, count in ab_dict.items():
+                if ab == "normal":
+                    continue
+                updated, added = self.stat_manager.update(ab, count=count, cooldown=self.cooldown)
+                if updated:
+                    new_abnormal = True
+                    if ab not in self.shown_behaviors:
+                        self.shown_behaviors.add(ab)
+                    self.log_behavior(ab, count=added)
+            
+            if new_abnormal and ab_set:
+                self.show_merged_intervention_dialog(ab_dict)
+        else:
+            # ========== 视频/摄像头：3秒行为确认逻辑 ==========
+            now = datetime.now()
+            
+            # 1. 更新当前帧检测到的异常行为时间戳
+            for behavior in ab_set:
+                if behavior == "normal":
+                    continue
+                if behavior not in self.behavior_confirmation:
+                    # 首次检测到该行为，开始计时
+                    self.behavior_confirmation[behavior] = {
+                        'first_seen': now,
+                        'last_seen': now,
+                        'confirmed': False,
+                        'count': ab_dict[behavior]
+                    }
+                else:
+                    # 持续中，更新最后出现时间和人数
+                    self.behavior_confirmation[behavior]['last_seen'] = now
+                    self.behavior_confirmation[behavior]['count'] = ab_dict[behavior]
+            
+            # 2. 检查哪些行为已持续满3秒且未确认
+            newly_confirmed = {}
+            for behavior, info in list(self.behavior_confirmation.items()):
+                if not info['confirmed']:
+                    duration = (now - info['first_seen']).total_seconds()
+                    if duration >= self.confirmation_duration:
+                        info['confirmed'] = True
+                        newly_confirmed[behavior] = info['count']
+            
+            # 3. 清理当前帧未出现的行为（允许0.5秒检测抖动，超过则重置计时）
+            for behavior in list(self.behavior_confirmation.keys()):
+                if behavior not in ab_set:
+                    time_since_last = (now - self.behavior_confirmation[behavior]['last_seen']).total_seconds()
+                    if time_since_last > 0.5:
+                        del self.behavior_confirmation[behavior]
+            
+            # 4. 对确认的行为更新统计、记录日志并弹窗
+            if newly_confirmed:
+                for behavior, count in newly_confirmed.items():
+                    updated, added = self.stat_manager.update(behavior, count=count, cooldown=self.cooldown)
+                    if updated:
+                        if behavior not in self.shown_behaviors:
+                            self.shown_behaviors.add(behavior)
+                        self.log_behavior(behavior, count=added)
+                
+                self.show_merged_intervention_dialog(newly_confirmed)
         
         self.update_stat()
         
@@ -1405,6 +1534,33 @@ class MainWindow(QMainWindow):
         html_text += "</div>"
         self.stat_label.setText(html_text)
         
+    def on_slider_pressed(self):
+        """用户按住进度条：暂停播放，标记为正在拖动"""
+        self.is_seeking = True
+        if self.thread and self.thread.isRunning():
+            self.thread.paused = True
+
+    def on_slider_released(self):
+        """用户松开进度条：计算目标帧并跳转"""
+        if not self.thread or not self.thread.cap:
+            self.is_seeking = False
+            return
+        
+        value = self.progress_slider.value()
+        total = int(self.thread.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total > 0:
+            target_frame = int(value / 100 * total)
+            self.thread.seek_target = target_frame
+        
+        self.is_seeking = False
+        if self.thread and self.thread.isRunning():
+            self.thread.paused = False
+
+    def update_progress(self, value):
+        """更新进度条（仅在非拖动状态下）"""
+        if not self.is_seeking:
+            self.progress_slider.setValue(value)
+        
     def stop_all(self):
         """停止所有处理"""
         if self.thread:
@@ -1414,12 +1570,29 @@ class MainWindow(QMainWindow):
                 self.thread.wait()
             self.thread = None
         self.save_current_session()
-        self.progress_bar.setVisible(False)
+        self.behavior_confirmation.clear()
+        self.progress_slider.setVisible(False)
+        self.is_seeking = False
+        self.pause_btn.setText("⏸️ 暂停")   # ← 重置文字
+        self.pause_btn.setEnabled(False)    # ← 禁用按钮
         self.status.setText("⏹️ 已停止")
         self.status.setStyleSheet("font-size: 12px; color: #a0aec0; font-weight: bold;")
         self.fps_label.setText("FPS: --")
         self.time_label.setText("⏱️ 检测耗时: 0.00s")
         
+    def pause_resume(self):
+        """暂停/继续切换"""
+        if self.thread and self.thread.isRunning():
+            self.thread.paused = not self.thread.paused
+            if self.thread.paused:
+                self.status.setText("⏸️ 已暂停")
+                self.status.setStyleSheet("font-size: 12px; color: #f6ad55; font-weight: bold;")
+                self.pause_btn.setText("▶️ 继续")  # ← 更新按钮文字
+            else:
+                self.status.setText("▶️ 继续检测")
+                self.status.setStyleSheet("font-size: 12px; color: #48bb78; font-weight: bold;")
+                self.pause_btn.setText("⏸️ 暂停")  # ← 更新按钮文字
+
     def open_cam(self):
         """打开摄像头"""
         self.stop_all()
@@ -1435,6 +1608,7 @@ class MainWindow(QMainWindow):
         
         self.start_new_session("camera", "摄像头实时检测")
         self.thread = VideoThread(0, conf_thres=self.conf_thres, sim_thres=self.sim_thres, iou_thres=iou)
+        self.pause_btn.setEnabled(True)
         self.thread.frame_signal.connect(self.show_frame)
         self.thread.error_signal.connect(lambda m: self.status.setText(f"错误: {m}"))
         self.thread.start()
@@ -1498,12 +1672,38 @@ class MainWindow(QMainWindow):
         
         self.start_new_session("video", f"{os.path.basename(src)} -> {os.path.basename(save_path)}")
         self.thread = VideoThread(src, save_path, self.conf_thres, self.sim_thres, iou)
+        self.pause_btn.setEnabled(True)
         self.thread.frame_signal.connect(self.show_frame)
-        self.thread.progress_signal.connect(self.progress_bar.setValue)
+        self.thread.progress_signal.connect(self.update_progress)
         self.thread.error_signal.connect(lambda m: self.status.setText(f"错误: {m}"))
         self.thread.start()
-        self.progress_bar.setVisible(True)
+        self.progress_slider.setVisible(True)
         self.status.setText("视频处理中...")
+
+    def open_video(self):
+        """打开视频文件，仅实时检测播放（不保存）"""
+        self.stop_all()
+        src, _ = QFileDialog.getOpenFileName(
+            self, "选择视频文件", "",
+            "视频文件 (*.mp4 *.avi *.mov *.mkv)")
+        if not src:
+            return
+        
+        iou = self.iou_slider.value() / 100
+        
+        self.start_new_session("video_play", os.path.basename(src))
+        # save_path=None 表示不保存，仅实时播放
+        self.thread = VideoThread(src, save_path=None, 
+                                  conf_thres=self.conf_thres, 
+                                  sim_thres=self.sim_thres, 
+                                  iou_thres=iou)
+        self.pause_btn.setEnabled(True)
+        self.thread.frame_signal.connect(self.show_frame)
+        self.thread.progress_signal.connect(self.update_progress)
+        self.thread.error_signal.connect(lambda m: self.status.setText(f"错误: {m}"))
+        self.thread.start()
+        self.progress_slider.setVisible(True)
+        self.status.setText("视频检测中...")
         
     def save_img(self):
         """保存图片"""
@@ -1739,10 +1939,7 @@ class MainWindow(QMainWindow):
         if event.key() == Qt.Key_Escape:
             self.stop_all()
         elif event.key() == Qt.Key_Space:
-            if self.thread and self.thread.running:
-                self.stop_all()
-            else:
-                self.open_cam()
+            self.pause_resume()
         elif event.key() == Qt.Key_S and event.modifiers() & Qt.ControlModifier:
             self.save_img()
         elif event.key() == Qt.Key_H:
