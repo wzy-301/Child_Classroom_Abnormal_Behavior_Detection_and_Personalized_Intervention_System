@@ -182,7 +182,7 @@ def compute_prototypes(embeddings, labels):
     prototypes = nn.functional.normalize(prototypes, p=2, dim=1)
     return prototypes
 
-def train_protonet(model, train_sampler, val_sampler, epochs=2000, lr=0.001):
+def train_protonet(model, train_sampler, val_sampler, epochs=1000, lr=0.001):
     """训练原型网络 - 冻结 backbone，只训练 projector，带验证早停"""
     model = model.to(DEVICE)
     
@@ -409,7 +409,7 @@ def main():
     
     # 训练
     print(f"\n[5/5] 开始训练...")
-    model = train_protonet(model, train_sampler, val_sampler, epochs=2000, lr=0.001)
+    model = train_protonet(model, train_sampler, val_sampler, epochs=1000, lr=0.001)
     
     # 评估
     print("\n" + "="*60)
