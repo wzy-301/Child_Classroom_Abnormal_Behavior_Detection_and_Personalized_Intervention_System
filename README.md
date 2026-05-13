@@ -1,6 +1,7 @@
 # 儿童课堂异常行为检测与个性化干预系统
 
 基于 **Prototypical Networks 少样本学习** 与 **CLIP 视觉-语言模型** 的儿童课堂异常行为检测与个性化干预系统。
+<img width="2433" height="1477" alt="image" src="https://github.com/user-attachments/assets/b0fa94f8-6e3c-42f4-8fbe-3ab91c92b82f" />
 
 ## 功能特点
 
